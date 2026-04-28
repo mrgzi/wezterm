@@ -14,14 +14,18 @@ use serde::Deserialize;
 #[cfg(feature = "use_serde")]
 use serde::Serialize;
 
-#[cfg(unix)]
+// `unix` module pulls in the `termios` crate which lacks Apple-mobile
+// `target_os` cfg branches; gate it off iOS/tvOS/watchOS/visionOS.
+// Mobile consumers don't run on a real TTY so the UnixTerminal driver
+// is never instantiated there anyway.
+#[cfg(all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))))]
 pub mod unix;
 #[cfg(windows)]
 pub mod windows;
 
 pub mod buffered;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))))]
 pub use self::unix::{UnixTerminal, UnixTerminalWaker as TerminalWaker};
 #[cfg(windows)]
 pub use self::windows::{WindowsTerminal, WindowsTerminalWaker as TerminalWaker};
@@ -112,7 +116,7 @@ pub trait Terminal {
 /// Ideally you wouldn't reference `SystemTerminal` in consuming
 /// code.  This type is exposed for convenience if you are doing
 /// something unusual and want easier access to the constructors.
-#[cfg(unix)]
+#[cfg(all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))))]
 pub type SystemTerminal = UnixTerminal;
 #[cfg(windows)]
 pub type SystemTerminal = WindowsTerminal;
@@ -126,6 +130,7 @@ pub type SystemTerminal = WindowsTerminal;
 /// If you have a more advanced use case you will want to look to the
 /// constructors for `UnixTerminal` and `WindowsTerminal` and call whichever
 /// one is most suitable for your needs.
+#[cfg(any(windows, all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))))]
 pub fn new_terminal(caps: Capabilities) -> Result<impl Terminal> {
     SystemTerminal::new(caps)
 }
