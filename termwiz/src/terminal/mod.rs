@@ -4,10 +4,23 @@ use crate::caps::probed::ProbeCapabilities;
 use crate::caps::Capabilities;
 use crate::input::InputEvent;
 use crate::surface::Change;
-use crate::{format_err, Result};
+use crate::Result;
+#[cfg(any(
+    windows,
+    all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))
+))]
+use crate::format_err;
 #[cfg(all(unix, any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))]
 use crate::bail;
+#[cfg(any(
+    windows,
+    all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))
+))]
 use num_traits::NumCast;
+#[cfg(any(
+    windows,
+    all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))
+))]
 use std::fmt::Display;
 use std::time::Duration;
 
@@ -187,6 +200,13 @@ impl Terminal for MobileStubTerminal {
     fn waker(&self) -> TerminalWaker { match *self {} }
 }
 
+// Only the `unix` and `windows` driver modules consume `cast`; on Apple
+// mobile targets both are cfg-gated off, leaving the helper unused.
+// Match the same cfg so the dead-code lint stays satisfied.
+#[cfg(any(
+    windows,
+    all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))
+))]
 pub(crate) fn cast<T: NumCast + Display + Copy, U: NumCast>(n: T) -> Result<U> {
     num_traits::cast(n).ok_or_else(|| format_err!("{} is out of bounds for this system", n))
 }
