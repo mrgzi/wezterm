@@ -974,7 +974,20 @@ impl Config {
             }
         }
 
-        #[cfg(all(unix, not(target_os = "macos")))]
+        // RLIMIT_NPROC is not defined on Apple platforms — macOS uses
+        // RLIMIT_NPROC via private API only, and iOS/tvOS/watchOS/visionOS
+        // omit it entirely from <sys/resource.h>. The `nix` crate's
+        // `Resource::RLIMIT_NPROC` variant is therefore absent on these
+        // targets, breaking the build. Gate the whole block off Apple
+        // mobile (and keep the existing macOS exclusion intact).
+        #[cfg(all(
+            unix,
+            not(target_os = "macos"),
+            not(target_os = "ios"),
+            not(target_os = "tvos"),
+            not(target_os = "watchos"),
+            not(target_os = "visionos"),
+        ))]
         {
             use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
             use std::convert::TryInto;

@@ -13,7 +13,11 @@ async-trait.workspace = true
 base64.workspace = true
 bintree.workspace = true
 bitflags.workspace = true
-chrono.workspace = true
+# `chrono` workspace default-features=false (workspace pulls only
+# `unstable-locales` + `serde`). `mux::client` calls `Utc::now()` which
+# requires the `clock` feature; enable it locally without touching the
+# workspace-wide chrono pin.
+chrono = {workspace=true, features=["clock"]}
 config.workspace = true
 crossbeam.workspace = true
 downcast-rs.workspace = true
