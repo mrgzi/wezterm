@@ -534,7 +534,8 @@ impl SessionHandler {
                 }
 
                 spawn_into_main_thread(async move {
-                    promise::spawn::spawn(async move {
+                    // `!Send` pane search future — runs inline on main thread.
+                    promise::spawn::spawn_local_inline(async move {
                         let result = do_search(pane_id, pattern, range, limit).await;
                         send_response(result);
                     })
@@ -1028,16 +1029,23 @@ fn schedule_domain_spawn_v2<SND>(
 ) where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
-    promise::spawn::spawn(async move { send_response(domain_spawn_v2(spawn, client_id).await) })
-        .detach();
+    // `!Send` mux future (Tab/Pane Arc) — `spawn_local_inline` runs it on the
+    // calling (main) thread. The plain `spawn` requires `Send` (termob fork:
+    // promise tick thread is separate).
+    promise::spawn::spawn_local_inline(async move {
+        send_response(domain_spawn_v2(spawn, client_id).await)
+    })
+    .detach();
 }
 
 fn schedule_split_pane<SND>(split: SplitPane, send_response: SND, client_id: Option<Arc<ClientId>>)
 where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
-    promise::spawn::spawn(async move { send_response(split_pane(split, client_id).await) })
-        .detach();
+    promise::spawn::spawn_local_inline(
+        async move { send_response(split_pane(split, client_id).await) },
+    )
+    .detach();
 }
 
 async fn split_pane(split: SplitPane, client_id: Option<Arc<ClientId>>) -> anyhow::Result<Pdu> {
@@ -1101,8 +1109,10 @@ fn schedule_move_pane<SND>(
 ) where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
-    promise::spawn::spawn(async move { send_response(move_pane(request, client_id).await) })
-        .detach();
+    promise::spawn::spawn_local_inline(async move {
+        send_response(move_pane(request, client_id).await)
+    })
+    .detach();
 }
 
 async fn move_pane(

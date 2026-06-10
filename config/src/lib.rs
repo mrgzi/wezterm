@@ -300,7 +300,7 @@ where
     F: Fn(Option<Rc<mlua::Lua>>) -> RETF,
     RETF: Future<Output = anyhow::Result<RET>>,
 {
-    promise::spawn::spawn(async move { with_lua_config_on_main_thread(func).await })
+    promise::spawn::spawn_local_inline(async move { with_lua_config_on_main_thread(func).await })
 }
 
 /// Spawn a future that will run with an optional Lua state from the most
