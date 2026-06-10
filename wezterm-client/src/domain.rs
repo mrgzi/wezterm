@@ -707,7 +707,7 @@ impl ClientDomain {
         Ok(())
     }
 
-    fn finish_attach(
+    pub fn finish_attach(
         domain_id: DomainId,
         client: Client,
         panes: ListPanesResponse,
