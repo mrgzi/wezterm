@@ -141,6 +141,50 @@ impl Default for SplitRequest {
     }
 }
 
+/// termob fork addition: build a `SplitDirectionAndSize` whose two halves
+/// reconstruct `tab` along `direction` — i.e. for Horizontal,
+/// `first.cols + second.cols + 1 == tab.cols` and both rows equal `tab.rows`
+/// (and symmetrically for Vertical). Used by `add_pane_no_split` so that the
+/// upstream geometry that reads this node (e.g. `remove_pane_if`'s survivor
+/// resize via `parent.width()/height()`) computes the real tab size instead of
+/// double-counting a full-size placeholder in each half.
+fn split_tab_size_in_half(tab: TerminalSize, direction: SplitDirection) -> SplitDirectionAndSize {
+    let mut first = tab;
+    let mut second = tab;
+    match direction {
+        SplitDirection::Horizontal => {
+            // Reserve 1 col for the divider; first gets the floor, second the rest.
+            let usable = tab.cols.saturating_sub(1);
+            first.cols = usable / 2;
+            second.cols = usable - first.cols;
+            let cell_w = if tab.cols > 0 {
+                tab.pixel_width / tab.cols
+            } else {
+                0
+            };
+            first.pixel_width = cell_w * first.cols;
+            second.pixel_width = cell_w * second.cols;
+        }
+        SplitDirection::Vertical => {
+            let usable = tab.rows.saturating_sub(1);
+            first.rows = usable / 2;
+            second.rows = usable - first.rows;
+            let cell_h = if tab.rows > 0 {
+                tab.pixel_height / tab.rows
+            } else {
+                0
+            };
+            first.pixel_height = cell_h * first.rows;
+            second.pixel_height = cell_h * second.rows;
+        }
+    }
+    SplitDirectionAndSize {
+        direction,
+        first,
+        second,
+    }
+}
+
 impl SplitDirectionAndSize {
     fn top_of_second(&self) -> usize {
         match self.direction {
@@ -746,6 +790,33 @@ impl Tab {
         self.inner
             .lock()
             .split_and_insert(pane_index, request, pane)
+    }
+
+    /// termob fork addition: add `pane` into this tab grouped next to the
+    /// pane identified by `anchor_pane_id`, WITHOUT performing any area /
+    /// split-size accounting.
+    ///
+    /// Unlike [`Self::split_and_insert`], this never computes split sizes,
+    /// never resizes panes, and never enforces the "No space for split!"
+    /// guard. It only mutates the tab's pane tree so that the new pane shares
+    /// this tab (so `resolve_pane_id` reports the same tab_id, keeping all
+    /// panes under one mux tab). The caller is expected to own the visual
+    /// layout (e.g. termob's egui_tiles) and to size the pane independently
+    /// via `Pane::resize`.
+    ///
+    /// Rationale: termob does not use the mux split-tree for rendering; it
+    /// reads grids via `Pane::get_lines` and lays panes out itself. The
+    /// upstream `split_pane` path halves the anchor pane on every split and
+    /// bails after a handful of panes ("No space"), which is a purely
+    /// cosmetic mux bookkeeping limit that termob must not hit.
+    ///
+    /// Returns the index of the newly inserted pane within the tab.
+    pub fn add_pane_no_split(
+        &self,
+        anchor_pane_id: PaneId,
+        pane: Arc<dyn Pane>,
+    ) -> anyhow::Result<usize> {
+        self.inner.lock().add_pane_no_split(anchor_pane_id, pane)
     }
 
     pub fn get_zoomed_pane(&self) -> Option<Arc<dyn Pane>> {
@@ -2092,6 +2163,72 @@ impl TabInner {
         })
     }
 
+    /// termob fork addition. See [`Tab::add_pane_no_split`]. Inserts `pane`
+    /// next to the anchor leaf without any split-size computation, pane
+    /// resize, or "No space" guard — only the tree mutation that groups the
+    /// pane under this tab.
+    fn add_pane_no_split(
+        &mut self,
+        anchor_pane_id: PaneId,
+        pane: Arc<dyn Pane>,
+    ) -> anyhow::Result<usize> {
+        if self.zoomed.is_some() {
+            anyhow::bail!("cannot add pane while zoomed");
+        }
+
+        // Resolve the anchor pane's leaf index.
+        let pane_index = self
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .find(|p| p.pane.pane_id() == anchor_pane_id)
+            .map(|p| p.index)
+            .ok_or_else(|| anyhow::anyhow!("anchor pane {} not in this tab", anchor_pane_id))?;
+
+        // Split metadata for the new node. termob does not use the mux
+        // split-tree for *rendering* (it lays panes out in egui), but the
+        // payload IS read by upstream geometry code on later mutations —
+        // notably `remove_pane_if`, which resizes the surviving sibling to
+        // `parent.width()/height()` when a grouped pane exits. For a
+        // Horizontal node `width() = first.cols + second.cols + 1`, so storing
+        // the full tab size in BOTH halves would resize the survivor to ~2x
+        // the tab width (garbled redraw until the next egui resize). Instead
+        // split the tab size in half so the two halves RECONSTRUCT the real
+        // tab dimensions: removal then resizes the survivor to the correct
+        // full-tab size. Sizes are still placeholders for layout purposes
+        // (termob re-resizes each pane to its egui tile), but they are now
+        // geometrically consistent for the upstream paths that read them.
+        let split_info = split_tab_size_in_half(self.size, SplitDirection::Horizontal);
+
+        let mut cursor = self.pane.take().unwrap().cursor();
+
+        match cursor.go_to_nth_leaf(pane_index) {
+            Ok(c) => cursor = c,
+            Err(c) => {
+                self.pane.replace(c.tree());
+                anyhow::bail!("invalid anchor pane index {}; cannot add pane!", pane_index);
+            }
+        };
+
+        // Convert the anchor leaf into a split node with the new pane on the
+        // right. No pane.resize / no area guard — caller owns sizing/layout.
+        match cursor.split_leaf_and_insert_right(pane) {
+            Ok(c) => cursor = c,
+            Err(c) => {
+                self.pane.replace(c.tree());
+                anyhow::bail!("failed to insert pane next to anchor index {}", pane_index);
+            }
+        };
+
+        match cursor.assign_node(Some(split_info)) {
+            Err(c) | Ok(c) => self.pane.replace(c.tree()),
+        };
+
+        let new_index = pane_index + 1;
+        self.active = new_index;
+        self.recency.tag(new_index);
+        Ok(new_index)
+    }
+
     fn get_zoomed_pane(&self) -> Option<Arc<dyn Pane>> {
         self.zoomed.clone()
     }
@@ -2203,6 +2340,49 @@ mod test {
     use rangeset::RangeSet;
     use std::ops::Range;
     use termwiz::surface::SequenceNo;
+
+    // termob fork: the dummy split node built by `add_pane_no_split` must have
+    // halves that RECONSTRUCT the tab size along the split direction, so that
+    // `remove_pane_if` (which resizes the survivor to `parent.width()/height()`)
+    // computes the real tab size instead of double-counting a full-size
+    // placeholder. Pins `split_tab_size_in_half`.
+    #[test]
+    fn termob_split_tab_size_in_half_reconstructs_tab_horizontal() {
+        let tab = TerminalSize {
+            cols: 80,
+            rows: 24,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let split = split_tab_size_in_half(tab, SplitDirection::Horizontal);
+        // width() = first.cols + second.cols + 1 must equal the tab width.
+        assert_eq!(
+            split.width(),
+            tab.cols,
+            "horizontal halves + divider must reconstruct tab cols"
+        );
+        // Rows unchanged for a horizontal split.
+        assert_eq!(split.height(), tab.rows);
+    }
+
+    #[test]
+    fn termob_split_tab_size_in_half_reconstructs_tab_vertical() {
+        let tab = TerminalSize {
+            cols: 80,
+            rows: 24,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let split = split_tab_size_in_half(tab, SplitDirection::Vertical);
+        assert_eq!(
+            split.height(),
+            tab.rows,
+            "vertical halves + divider must reconstruct tab rows"
+        );
+        assert_eq!(split.width(), tab.cols);
+    }
     use url::Url;
     use wezterm_term::color::ColorPalette;
     use wezterm_term::{KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex};
