@@ -235,6 +235,54 @@ impl HeadlessImpl {
     }
 }
 
+/// Headless `ConnectionUI` backend that answers `Input` requests via a
+/// caller-supplied responder. Used by embedded hosts to wire SSH auth
+/// prompts (password, passphrase, host-verify) to existing credentials
+/// without opening a terminal-overlay window.
+struct ResponderImpl {
+    rx: Receiver<UIRequest>,
+    responder: Box<dyn Fn(&str, bool) -> Option<String> + Send + 'static>,
+}
+
+impl ResponderImpl {
+    fn run(&mut self) -> anyhow::Result<()> {
+        loop {
+            match self.rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(UIRequest::Close) => break,
+                Ok(UIRequest::Output(changes)) => {
+                    log::trace!("Output: {:?}", changes);
+                }
+                Ok(UIRequest::Input {
+                    prompt,
+                    echo,
+                    mut respond,
+                }) => {
+                    let answer = (self.responder)(&prompt, echo);
+                    match answer {
+                        Some(s) => respond.result(Ok(s)),
+                        None => respond.result(Err(anyhow!(
+                            "Input prompt {:?} declined by embedded responder",
+                            prompt
+                        ))),
+                    };
+                }
+                Ok(UIRequest::Sleep {
+                    mut respond,
+                    reason,
+                    duration,
+                }) => {
+                    log::trace!("{} (sleeping for {:?})", reason, duration);
+                    std::thread::sleep(duration);
+                    respond.result(Ok(()));
+                }
+                Err(err) if err.is_timeout() => {}
+                Err(err) => bail!("recv_timeout: {}", err),
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default, Clone, Copy, Debug)]
 pub struct ConnectionUIParams {
     pub size: TerminalSize,
@@ -290,6 +338,29 @@ impl ConnectionUI {
         let (tx, rx) = unbounded();
         std::thread::spawn(move || {
             let mut ui = HeadlessImpl { rx };
+            ui.run()
+        });
+        Self { tx }
+    }
+
+    /// Termob fork addition: a headless `ConnectionUI` whose `Input`
+    /// prompts are answered by `responder` instead of an interactive
+    /// terminal overlay. Used by embedded hosts (mobile, GUI) to feed
+    /// SSH auth answers from a modal / keychain.
+    ///
+    /// `responder` receives `(prompt, echo)` and returns the answer, or
+    /// `None` to fail the prompt (caller-cancelled). `echo == false`
+    /// means it is a password/passphrase prompt.
+    pub fn new_with_input_responder<F>(responder: F) -> Self
+    where
+        F: Fn(&str, bool) -> Option<String> + Send + 'static,
+    {
+        let (tx, rx) = unbounded();
+        std::thread::spawn(move || {
+            let mut ui = ResponderImpl {
+                rx,
+                responder: Box::new(responder),
+            };
             ui.run()
         });
         Self { tx }
