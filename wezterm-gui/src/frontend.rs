@@ -201,6 +201,9 @@ impl GuiFrontEnd {
                     .detach();
                 }
             }
+            // Termob fork: opaque termob-proto traffic — the GUI frontend does
+            // not consume it (termob has its own subscriber).
+            MuxNotification::TermobChannel { .. } => {}
             true
         });
         // Re-evaluate the config so that folks that are using

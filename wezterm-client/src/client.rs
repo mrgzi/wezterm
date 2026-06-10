@@ -10,6 +10,7 @@ use futures::FutureExt;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::DomainId;
+use mux::MuxNotification;
 use mux::pane::PaneId;
 use mux::ssh::ssh_connect_with_ui;
 use mux::Mux;
@@ -315,6 +316,32 @@ fn process_unilateral(
             })
             .detach();
 
+            return Ok(());
+        }
+        // Termob fork: opaque termob-proto message from the server. Relay it
+        // verbatim to termob's mux subscriber as `MuxNotification::TermobChannel`.
+        // We do NOT route through `process_unilateral_inner` (remote→local pane
+        // map) because the payload carries termob's own remote pane id and may
+        // be connection-level (pane_id == 0, e.g. a state delta push); the mux
+        // layer must not interpret it.
+        Pdu::TermobChannelResponse(TermobChannelResponse {
+            pane_id,
+            call_id,
+            payload,
+        }) => {
+            let pane_id = *pane_id;
+            let call_id = *call_id;
+            let payload = std::sync::Arc::new(payload.clone());
+            promise::spawn::spawn_into_main_thread(async move {
+                if let Some(mux) = Mux::try_get() {
+                    mux.notify(MuxNotification::TermobChannel {
+                        pane_id,
+                        call_id,
+                        payload,
+                    });
+                }
+            })
+            .detach();
             return Ok(());
         }
         _ => {}

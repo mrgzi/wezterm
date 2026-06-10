@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 45;
+pub const CODEC_VERSION: usize = 46;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -502,6 +502,8 @@ pdu! {
     GetPaneDirection: 60,
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
+    TermobChannelRequest: 63,
+    TermobChannelResponse: 64,
 }
 
 impl Pdu {
@@ -707,6 +709,39 @@ pub struct SpawnResponse {
 pub struct WriteToPane {
     pub pane_id: PaneId,
     pub data: Vec<u8>,
+}
+
+/// Termob fork addition: an OPAQUE channel request from client to server.
+///
+/// The mux codec is terminal-specific; termob layers its own RPC (capability
+/// dispatch + per-tab state sync) on top of the same mux connection. This PDU
+/// is a generic carrier: the wire layer does NOT interpret `payload` — it is a
+/// serialized `termob-proto` message whose schema lives entirely outside
+/// wezterm. `call_id` correlates the response (`TermobChannelResponse`). This
+/// is deliberately the OPPOSITE of embedding termob's state schema into the
+/// codec (which would couple wezterm to termob's data model).
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct TermobChannelRequest {
+    /// Target pane (binds the request to a mux session). `0` = connection-level.
+    pub pane_id: PaneId,
+    /// Correlation id — the server echoes it in `TermobChannelResponse`.
+    pub call_id: u64,
+    /// Opaque termob-proto payload (wezterm does not interpret it).
+    pub payload: Vec<u8>,
+}
+
+/// Termob fork addition: the OPAQUE response to a `TermobChannelRequest`, or an
+/// unsolicited server→client push (e.g. per-tab state delta) when sent with
+/// `call_id == 0`. Like the request, `payload` is opaque termob-proto bytes;
+/// wezterm only transports it.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct TermobChannelResponse {
+    /// Originating pane (or `0` for connection-level / unsolicited push).
+    pub pane_id: PaneId,
+    /// Correlation id from the matching request, or `0` for an unsolicited push.
+    pub call_id: u64,
+    /// Opaque termob-proto payload (wezterm does not interpret it).
+    pub payload: Vec<u8>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

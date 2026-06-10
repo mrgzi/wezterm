@@ -17,6 +17,35 @@ use url::Url;
 use wezterm_term::terminal::Alert;
 use wezterm_term::StableRowIndex;
 
+/// Termob fork addition: handler for the opaque `TermobChannelRequest` PDU.
+///
+/// The mux server itself does NOT understand termob's RPC payload — it only
+/// transports it. An embedding host (termob-server) installs this handler via
+/// [`set_termob_channel_handler`]; the handler receives `(pane_id, call_id,
+/// payload)` and returns the opaque response bytes, which the server wraps in a
+/// `TermobChannelResponse`. Keeping the schema out of the codec is deliberate:
+/// wezterm stays terminal-only, termob's data model lives in `termob-proto`.
+pub type TermobChannelHandler = dyn Fn(PaneId, u64, Vec<u8>) -> Vec<u8> + Send + Sync;
+
+static TERMOB_CHANNEL_HANDLER: Mutex<Option<Arc<TermobChannelHandler>>> = Mutex::new(None);
+
+/// Install the opaque channel handler. Called once at server startup by the
+/// embedding host (termob-server). Idempotent-ish: last writer wins.
+pub fn set_termob_channel_handler(handler: Arc<TermobChannelHandler>) {
+    if let Ok(mut guard) = TERMOB_CHANNEL_HANDLER.lock() {
+        *guard = Some(handler);
+    }
+}
+
+/// Snapshot the currently-installed handler (cheap `Arc` clone), or `None` if
+/// no embedding host registered one (plain `wezterm-mux-server` binary).
+fn termob_channel_handler() -> Option<Arc<TermobChannelHandler>> {
+    TERMOB_CHANNEL_HANDLER
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
 #[derive(Clone)]
 pub struct PduSender {
     func: Arc<dyn Fn(DecodedPdu) -> anyhow::Result<()> + Send + Sync>,
@@ -988,8 +1017,57 @@ impl SessionHandler {
                 .detach();
             }
 
+            // Termob fork: opaque RPC carrier. Dispatch to the embedding host's
+            // handler (if installed) and wrap its opaque reply. The codec never
+            // inspects `payload`. No handler → ErrorResponse (plain mux-server
+            // does not speak termob-proto).
+            //
+            // **Offloaded to a dedicated thread (NOT the main thread):** the
+            // handler performs BLOCKING work (cap-std filesystem syscalls). If
+            // it ran inside `spawn_into_main_thread`, a slow syscall (large file,
+            // hung network FS) would block the single main-thread executor and
+            // freeze EVERY connected client's keystroke/spawn/resize PDUs until
+            // it returned. The handler and `PduSender` are both `Send + Sync`, so
+            // we run it off-thread and send the response straight back from there
+            // — the main dispatch loop never stalls on a host-call. Thread-per-
+            // call is fine: host-calls (webview syscalls) are infrequent.
+            Pdu::TermobChannelRequest(TermobChannelRequest {
+                pane_id,
+                call_id,
+                payload,
+            }) => {
+                let handler = termob_channel_handler();
+                let resp_sender = self.to_write_tx.clone();
+                let spawn_result = std::thread::Builder::new()
+                    .name("termob-host-call".into())
+                    .spawn(move || {
+                        let pdu = match handler {
+                            Some(h) => {
+                                let reply = h(pane_id, call_id, payload);
+                                Pdu::TermobChannelResponse(TermobChannelResponse {
+                                    pane_id,
+                                    call_id,
+                                    payload: reply,
+                                })
+                            }
+                            None => Pdu::ErrorResponse(ErrorResponse {
+                                reason:
+                                    "TermobChannelRequest received but no channel handler installed"
+                                        .to_string(),
+                            }),
+                        };
+                        resp_sender.send(DecodedPdu { pdu, serial }).ok();
+                    });
+                if let Err(err) = spawn_result {
+                    // Thread spawn failed (resource exhaustion) — respond inline
+                    // so the client doesn't hang waiting for a reply.
+                    send_response(Err(anyhow!("spawn host-call thread: {err}")));
+                }
+            }
+
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
-            Pdu::Pong { .. }
+            Pdu::TermobChannelResponse { .. }
+            | Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }
             | Pdu::SetClipboard { .. }
             | Pdu::NotifyAlert { .. }

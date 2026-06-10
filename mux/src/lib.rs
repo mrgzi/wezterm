@@ -95,6 +95,16 @@ pub enum MuxNotification {
         old_workspace: String,
         new_workspace: String,
     },
+    /// Termob fork addition: an opaque termob-proto message arrived from the
+    /// server over the `TermobChannelResponse` PDU (capability reply when
+    /// `call_id != 0`, or an unsolicited push such as a per-tab state delta
+    /// when `call_id == 0`). The mux layer does not interpret `payload`; it
+    /// only relays it to termob's subscriber (which decodes termob-proto).
+    TermobChannel {
+        pane_id: PaneId,
+        call_id: u64,
+        payload: Arc<Vec<u8>>,
+    },
 }
 
 static SUB_ID: AtomicUsize = AtomicUsize::new(0);

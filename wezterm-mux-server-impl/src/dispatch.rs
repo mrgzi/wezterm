@@ -203,6 +203,24 @@ where
                 stream.flush().await.context("flushing PDU to client")?;
             }
             Ok(Item::Notif(MuxNotification::ActiveWorkspaceChanged(_))) => {}
+            // Termob fork: relay an opaque termob-proto message to this client as
+            // an unsolicited `TermobChannelResponse` (serial 0). Used for
+            // server→client pushes such as per-tab state deltas. The payload is
+            // opaque; the codec does not interpret it.
+            Ok(Item::Notif(MuxNotification::TermobChannel {
+                pane_id,
+                call_id,
+                payload,
+            })) => {
+                Pdu::TermobChannelResponse(codec::TermobChannelResponse {
+                    pane_id,
+                    call_id,
+                    payload: (*payload).clone(),
+                })
+                .encode_async(&mut stream, 0)
+                .await?;
+                stream.flush().await.context("flushing PDU to client")?;
+            }
             Ok(Item::Notif(MuxNotification::Empty)) => {}
             Err(err) => {
                 log::error!("process_async Err {}", err);

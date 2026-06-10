@@ -1314,6 +1314,8 @@ impl TermWindow {
                 | MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
                 | MuxNotification::Empty
+                // Termob fork: opaque termob-proto traffic — not consumed here.
+                | MuxNotification::TermobChannel { .. }
                 | MuxNotification::WindowCreated(_) => {}
             },
             TermWindowNotif::EmitStatusUpdate => {
@@ -1525,6 +1527,8 @@ impl TermWindow {
             | MuxNotification::ActiveWorkspaceChanged(_)
             | MuxNotification::WorkspaceRenamed { .. }
             | MuxNotification::Empty
+            // Termob fork: opaque termob-proto traffic — not consumed by the GUI.
+            | MuxNotification::TermobChannel { .. }
             | MuxNotification::WindowWorkspaceChanged(_) => return true,
             MuxNotification::Alert {
                 alert: Alert::PaletteChanged { .. },
