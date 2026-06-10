@@ -211,6 +211,9 @@ where
                 pane_id,
                 call_id,
                 payload,
+                // The local-domain tag is a client-side concept; the PDU does
+                // not carry it.
+                domain: _,
             })) => {
                 Pdu::TermobChannelResponse(codec::TermobChannelResponse {
                     pane_id,

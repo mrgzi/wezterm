@@ -104,6 +104,14 @@ pub enum MuxNotification {
         pane_id: PaneId,
         call_id: u64,
         payload: Arc<Vec<u8>>,
+        /// Termob fork: the LOCAL ClientDomain that received this message
+        /// from its server connection, or `None` when the notification
+        /// originates server-side (outgoing push, encoded by dispatch).
+        /// Consumers that multiplex several server connections in one mux
+        /// use this to scope a push to the tab attached to that domain —
+        /// payload-level ids (e.g. termob tab ids) are only unique per
+        /// server and may collide across two different servers.
+        domain: Option<crate::domain::DomainId>,
     },
 }
 

@@ -338,6 +338,7 @@ fn process_unilateral(
                         pane_id,
                         call_id,
                         payload,
+                        domain: Some(local_domain_id),
                     });
                 }
             })
