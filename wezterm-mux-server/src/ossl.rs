@@ -12,13 +12,15 @@ use wezterm_mux_server_impl::PKI;
 struct OpenSSLNetListener {
     acceptor: Arc<SslAcceptor>,
     listener: TcpListener,
+    verify_peer: bool,
 }
 
 impl OpenSSLNetListener {
-    pub fn new(listener: TcpListener, acceptor: SslAcceptor) -> Self {
+    pub fn new(listener: TcpListener, acceptor: SslAcceptor, verify_peer: bool) -> Self {
         Self {
             listener,
             acceptor: Arc::new(acceptor),
+            verify_peer,
         }
     }
 
@@ -78,9 +80,11 @@ impl OpenSSLNetListener {
 
                     match acceptor.accept(stream) {
                         Ok(stream) => {
-                            if let Err(err) = Self::verify_peer_cert(&stream) {
-                                log::error!("problem with peer cert: {}", err);
-                                break;
+                            if self.verify_peer {
+                                if let Err(err) = Self::verify_peer_cert(&stream) {
+                                    log::error!("problem with peer cert: {}", err);
+                                    continue;
+                                }
                             }
                             spawn_into_main_thread(async move {
                                 log::error!("Making new AsyncSslStream");
@@ -109,7 +113,7 @@ impl OpenSSLNetListener {
     }
 }
 
-pub fn spawn_tls_listener(tls_server: &TlsDomainServer) -> Result<(), Error> {
+pub fn spawn_tls_listener(tls_server: &TlsDomainServer, verify_peer: bool) -> Result<(), Error> {
     openssl::init();
 
     let mut acceptor = SslAcceptor::mozilla_modern(SslMethod::tls())?;
@@ -166,7 +170,11 @@ pub fn spawn_tls_listener(tls_server: &TlsDomainServer) -> Result<(), Error> {
         .cert_store_mut()
         .add_cert(load_cert(&PKI.ca_pem())?)?;
 
-    acceptor.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    if verify_peer {
+        acceptor.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    } else {
+        acceptor.set_verify(SslVerifyMode::NONE);
+    }
 
     let acceptor = acceptor.build();
 
@@ -180,6 +188,7 @@ pub fn spawn_tls_listener(tls_server: &TlsDomainServer) -> Result<(), Error> {
             )
         })?,
         acceptor,
+        verify_peer,
     );
     std::thread::spawn(move || {
         net_listener.run();

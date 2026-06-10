@@ -1,16 +1,8 @@
 use clap::*;
-use config::configuration;
-use mux::activity::Activity;
-use mux::domain::{Domain, LocalDomain};
-use mux::Mux;
 use portable_pty::cmdbuilder::CommandBuilder;
 use std::ffi::OsString;
 use std::process::Command;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::thread;
 use wezterm_gui_subcommands::*;
-use wezterm_mux_server_impl::update_mux_domains_for_server;
 
 mod daemonize;
 
@@ -73,35 +65,23 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-    env_bootstrap::bootstrap();
-
-    //stats::Stats::init()?;
-    config::designate_this_as_the_main_thread();
     let _saver = umask::UmaskSaver::new();
-
     let opts = Opt::parse();
 
     #[cfg(unix)]
     {
-        // Ensure that we set CLOEXEC on the inherited lock file
-        // before we have an opportunity to spawn any child processes.
         if let Some(fd) = opts.pid_file_fd {
             daemonize::set_cloexec(fd, true);
         }
     }
 
-    config::common_init(
+    wezterm_mux_server::bootstrap_config(
         opts.config_file.as_ref(),
         &opts.config_override,
         opts.skip_config,
     )?;
 
     let config = config::configuration();
-
-    config.update_ulimit()?;
-    if let Some(value) = &config.default_ssh_auth_sock {
-        std::env::set_var("SSH_AUTH_SOCK", value);
-    }
 
     #[cfg(unix)]
     let mut pid_file = None;
@@ -110,26 +90,14 @@ fn run() -> anyhow::Result<()> {
     {
         if opts.daemonize {
             pid_file = daemonize::daemonize(&config)?;
-            // When we reach this line, we are in a forked child process,
-            // and the fork will have broken the async-io/reactor state
-            // of the smol runtime.
-            // To resolve this, we will re-exec ourselves in the block
-            // below that was originally Windows-specific
         }
     }
 
     if opts.daemonize {
-        // On Windows we can't literally daemonize, but we can spawn another copy
-        // of ourselves in the background!
-        // On Unix, forking breaks the global state maintained by `smol`,
-        // so we need to re-exec ourselves to start things back up properly.
         let mut cmd = Command::new(std::env::current_exe().unwrap());
 
         #[cfg(unix)]
         {
-            // Inform the new version of ourselves that we already
-            // locked the pidfile so that it can prevent it from
-            // being propagated to its children when they spawn
             if let Some(fd) = pid_file {
                 cmd.arg("--pid-file-fd");
                 cmd.arg(&fd.to_string());
@@ -185,141 +153,28 @@ fn run() -> anyhow::Result<()> {
         }
     }
 
-    // Remove some environment variables that aren't super helpful or
-    // that are potentially misleading when we're starting up the
-    // server.
-    // We may potentially want to look into starting/registering
-    // a session of some kind here as well in the future.
-    for name in &[
-        "OLDPWD",
-        "PWD",
-        "SHLVL",
-        "WEZTERM_PANE",
-        "WEZTERM_UNIX_SOCKET",
-        "_",
-    ] {
-        std::env::remove_var(name);
+    wezterm_mux_server::scrub_env();
+    wezterm_mux_server::init_blob_leases()?;
+
+    let cmd = build_command(opts.prog, opts.cwd);
+
+    wezterm_mux_server::init_mux()?;
+    wezterm_mux_server::spawn_listeners(true)?;
+    wezterm_mux_server::run_executor_loop(cmd)
+}
+
+fn build_command(prog: Vec<OsString>, cwd: Option<OsString>) -> Option<CommandBuilder> {
+    let need_builder = !prog.is_empty() || cwd.is_some();
+    if !need_builder {
+        return None;
     }
-    for name in &config::configuration().mux_env_remove {
-        std::env::remove_var(name);
-    }
-
-    wezterm_blob_leases::register_storage(Arc::new(
-        wezterm_blob_leases::simple_tempdir::SimpleTempDir::new_in(&*config::CACHE_DIR)?,
-    ))?;
-
-    let need_builder = !opts.prog.is_empty() || opts.cwd.is_some();
-
-    let cmd = if need_builder {
-        let mut builder = if opts.prog.is_empty() {
-            CommandBuilder::new_default_prog()
-        } else {
-            CommandBuilder::from_argv(opts.prog)
-        };
-        if let Some(cwd) = opts.cwd {
-            builder.cwd(cwd);
-        }
-        Some(builder)
+    let mut builder = if prog.is_empty() {
+        CommandBuilder::new_default_prog()
     } else {
-        None
+        CommandBuilder::from_argv(prog)
     };
-
-    let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
-    let mux = Arc::new(mux::Mux::new(Some(domain.clone())));
-    Mux::set_mux(&mux);
-
-    let executor = promise::spawn::SimpleExecutor::new();
-
-    spawn_listener().map_err(|e| {
-        log::error!("problem spawning listeners: {:?}", e);
-        e
-    })?;
-
-    let activity = Activity::new();
-
-    promise::spawn::spawn(async move {
-        if let Err(err) = async_run(cmd).await {
-            terminate_with_error(err);
-        }
-        drop(activity);
-    })
-    .detach();
-
-    loop {
-        executor.tick()?;
+    if let Some(cwd) = cwd {
+        builder.cwd(cwd);
     }
-}
-
-async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
-    if let Some(lua) = lua {
-        let args = lua.pack_multi(())?;
-        config::lua::emit_event(&lua, ("mux-startup".to_string(), args)).await?;
-    }
-    Ok(())
-}
-
-async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
-    let mux = Mux::get();
-    let config = config::configuration();
-
-    update_mux_domains_for_server(&config)?;
-    let _config_subscription = config::subscribe_to_config_reload(move || {
-        promise::spawn::spawn_into_main_thread(async move {
-            if let Err(err) = update_mux_domains_for_server(&config::configuration()) {
-                log::error!("Error updating mux domains: {:#}", err);
-            }
-        })
-        .detach();
-        true
-    });
-
-    let domain = mux.default_domain();
-
-    {
-        if let Err(err) = config::with_lua_config_on_main_thread(trigger_mux_startup).await {
-            log::error!("while processing mux-startup event: {:#}", err);
-        }
-    }
-
-    let have_panes_in_domain = mux
-        .iter_panes()
-        .iter()
-        .any(|p| p.domain_id() == domain.domain_id());
-
-    if !have_panes_in_domain {
-        let workspace = None;
-        let position = None;
-        let window_id = mux.new_empty_window(workspace, position);
-        domain.attach(Some(*window_id)).await?;
-
-        let _tab = mux
-            .default_domain()
-            .spawn(config.initial_size(0, None), cmd, None, *window_id)
-            .await?;
-    }
-    Ok(())
-}
-
-fn terminate_with_error(err: anyhow::Error) -> ! {
-    log::error!("{:#}; terminating", err);
-    std::process::exit(1);
-}
-
-mod ossl;
-
-pub fn spawn_listener() -> anyhow::Result<()> {
-    let config = configuration();
-    for unix_dom in &config.unix_domains {
-        std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
-        let mut listener = wezterm_mux_server_impl::local::LocalListener::with_domain(unix_dom)?;
-        thread::spawn(move || {
-            listener.run();
-        });
-    }
-
-    for tls_server in &config.tls_servers {
-        ossl::spawn_tls_listener(tls_server)?;
-    }
-
-    Ok(())
+    Some(builder)
 }
