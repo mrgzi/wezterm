@@ -491,6 +491,20 @@ impl SessionHandler {
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
                             pane.erase_scrollback(erase_mode);
+                            // Erasing the scrollback/viewport bumps the pane's
+                            // seqno but produces NO PTY output, so the mux does
+                            // not emit a `PaneOutput` notification — the fan-out
+                            // path that every connection's subscriber uses to
+                            // push render changes. Without it, OTHER connected
+                            // clients (not the one that issued the clear) keep
+                            // rendering the stale screen until an unrelated delta
+                            // (e.g. a keystroke). Synthesize the same notification
+                            // so all connections push the cleared grid. A
+                            // per-connection push here would only update the
+                            // issuing client, not the others.
+                            Mux::notify_from_any_thread(MuxNotification::PaneOutput(
+                                pane.pane_id(),
+                            ));
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,
