@@ -3,6 +3,7 @@
 //! with their own CLI + capability dispatch instead of duplicating the
 //! bootstrap sequence.
 
+use std::io::{Read, Write};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -89,6 +90,30 @@ pub fn spawn_listeners(tls_verify_peer: bool) -> anyhow::Result<()> {
         ossl::spawn_tls_listener(tls_server, tls_verify_peer)?;
     }
 
+    Ok(())
+}
+
+/// Copy bytes from `from_stream` to `to_stream` in 8 KiB chunks until EOF
+/// or error. This is the byte pump used by the `proxy` byte-pipe mode
+/// (SSH-mux netcat over a UDS socket). Exposed from the library so that
+/// embedding crates (e.g. termob-server) reuse the exact same loop instead
+/// of hand-rolling it; the original lived in `wezterm/src/cli/proxy.rs` as
+/// `consume_stream`. Process-exit / shutdown policy stays with the caller —
+/// this function only copies and returns.
+pub fn consume_stream<F: Read, T: Write>(
+    mut from_stream: F,
+    mut to_stream: T,
+) -> anyhow::Result<()> {
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let size = from_stream.read(&mut buf)?;
+        if size == 0 {
+            break;
+        }
+        to_stream.write_all(&buf[0..size])?;
+        to_stream.flush()?;
+    }
     Ok(())
 }
 
