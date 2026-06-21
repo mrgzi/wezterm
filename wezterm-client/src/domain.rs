@@ -619,18 +619,35 @@ impl ClientDomain {
                 });
 
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
-                    let mut window = mux
-                        .get_window_mut(local_window_id)
-                        .expect("no such window!?");
+                    // The mapping may be stale: the local window can be removed
+                    // (e.g. during detach) while a ListPanes resync is in flight,
+                    // leaving the remote->local entry pointing at a window that no
+                    // longer exists in the mux. Don't panic; drop the stale entry
+                    // and fall through to (re)create a window below. This mirrors
+                    // the graceful `if let Some(..)` handling in
+                    // process_remote_window_title_change.
+                    if let Some(mut window) = mux.get_window_mut(local_window_id) {
+                        log::debug!(
+                            "domain: {} adding tab to existing local window {}",
+                            inner.local_domain_id,
+                            local_window_id
+                        );
+                        if window.idx_by_id(tab.tab_id()).is_none() {
+                            window.push(&tab);
+                        }
+                        continue;
+                    }
                     log::debug!(
-                        "domain: {} adding tab to existing local window {}",
+                        "domain: {} stale remote->local window mapping {} -> {}; window gone, recreating",
                         inner.local_domain_id,
+                        remote_window_id,
                         local_window_id
                     );
-                    if window.idx_by_id(tab.tab_id()).is_none() {
-                        window.push(&tab);
-                    }
-                    continue;
+                    inner
+                        .remote_to_local_window
+                        .lock()
+                        .unwrap()
+                        .remove(&remote_window_id);
                 }
 
                 if let Some(local_window_id) = primary_window_id {
@@ -671,10 +688,12 @@ impl ClientDomain {
 
         for (remote_window_id, window_title) in panes.window_titles {
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
-                let mut window = mux
-                    .get_window_mut(local_window_id)
-                    .expect("no such window!?");
-                window.set_title(&window_title);
+                // Stale mapping tolerance (see the tab-add path above): the
+                // window may be gone if a detach raced this resync. Skip the
+                // title update rather than panicking.
+                if let Some(mut window) = mux.get_window_mut(local_window_id) {
+                    window.set_title(&window_title);
+                }
             }
         }
 
