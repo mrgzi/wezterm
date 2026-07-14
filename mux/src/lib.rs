@@ -793,6 +793,42 @@ impl Mux {
             .insert(domain.domain_name().to_string(), Arc::clone(domain));
     }
 
+    /// Remove a domain from the registry, dropping the mux's `Arc` to it.
+    ///
+    /// The stock mux only ever adds domains (they are config-defined and
+    /// app-lifetime), so there was no removal path and the `domains` /
+    /// `domains_by_name` maps grew without bound as clients created new
+    /// `ClientDomain`s on each connection. Callers that create domains
+    /// dynamically (e.g. per remote connection) use this to release a domain
+    /// once its client has disconnected, so the registry does not accumulate
+    /// dead entries (and their never-pruned notification subscribers).
+    ///
+    /// This does not touch panes/tabs/windows — call `domain_was_detached`
+    /// first (or ensure the domain is already detached) so its panes are gone.
+    ///
+    /// If the removed domain was the `default_domain`, the default is
+    /// re-pointed at another remaining domain rather than left empty: several
+    /// call sites read `default_domain()` with an unconditional `unwrap`, so a
+    /// `None` default would arm a panic. Only when the last domain is removed
+    /// does the default become `None` (matching the never-added initial state).
+    pub fn remove_domain(&self, domain_id: DomainId) -> Option<Arc<dyn Domain>> {
+        let removed = self.domains.write().remove(&domain_id);
+        if let Some(domain) = &removed {
+            self.domains_by_name.write().remove(domain.domain_name());
+            // Compute the replacement default *before* taking the default lock,
+            // so we never hold `default_domain` and `domains` at once (keeps
+            // lock ordering disjoint from `add_domain`).
+            let replacement = self.domains.read().values().next().map(Arc::clone);
+            let mut default = self.default_domain.write();
+            if default.as_ref().is_some_and(|d| d.domain_id() == domain_id) {
+                // Re-point default at a remaining domain (None only if empty),
+                // so `default_domain().unwrap()` callers never see a hole.
+                *default = replacement;
+            }
+        }
+        removed
+    }
+
     pub fn set_mux(mux: &Arc<Mux>) {
         MUX.lock().replace(Arc::clone(mux));
     }
