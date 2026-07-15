@@ -179,7 +179,9 @@ rangeset = { path = "rangeset" }
 ratelim= { path = "ratelim" }
 raw-window-handle = "0.6"
 rayon = "1.10"
-rcgen = "0.12"
+# x509-parser feature: needed by the termob fork's persistent-CA support
+# (CertificateParams::from_ca_cert_pem reloads the CA from disk).
+rcgen = { version = "0.12", features = ["x509-parser"] }
 regex = "1"
 reqwest = "0.12"
 resize = "0.5"
