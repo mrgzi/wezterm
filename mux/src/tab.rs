@@ -878,7 +878,20 @@ impl TabInner {
         self.zoomed = zoomed;
         self.size = size;
 
-        self.resize(size);
+        // Termob fork: do NOT call self.resize(size) here. This method runs
+        // on the CLIENT side (ClientDomain attach/resync) and the tree we
+        // just built already carries the server's authoritative per-pane
+        // sizes in the split node data; the leaf ClientPane dimensions are
+        // kept up to date by render deltas. Calling resize() would walk the
+        // leaves and invoke ClientPane::resize, which sends Resize PDUs
+        // BACK to the server whenever the locally cached dimensions are
+        // momentarily stale. Combined with the server broadcasting
+        // TabResized for every received Resize PDU (which triggers a resync
+        // on every client), that echo sustains a resize storm between
+        // multiple attached clients: each resync re-asserts a possibly
+        // stale size, each assert triggers another broadcast, and the PTY
+        // size ping-pongs. Local bookkeeping (self.size + node data) is
+        // all the client needs.
 
         log::debug!(
             "sync tab: {:#?} zoomed: {} {:#?}",
@@ -1291,6 +1304,18 @@ impl TabInner {
             return;
         }
 
+        /// Collects every split node's (first, second) sizes so we can tell
+        /// whether the rebuild actually changed anything.
+        fn collect_split_sizes(node: &Tree, out: &mut Vec<(TerminalSize, TerminalSize)>) {
+            if let Tree::Node { left, right, data } = node {
+                if let Some(data) = data {
+                    out.push((data.first, data.second));
+                }
+                collect_split_sizes(left, out);
+                collect_split_sizes(right, out);
+            }
+        }
+
         fn compute_size(node: &mut Tree) -> Option<TerminalSize> {
             match node {
                 Tree::Empty => None,
@@ -1321,12 +1346,34 @@ impl TabInner {
             }
         }
 
+        // Termob fork: only notify TabResized when the rebuild actually
+        // changed the tab size or any split allocation. The upstream
+        // unconditional notify turns even a no-op Resize PDU into a
+        // TabResized broadcast, which triggers a full resync on every
+        // attached client; with more than one client those resyncs can
+        // re-assert sizes and re-trigger the broadcast, amplifying into a
+        // sustained resize storm. Notifying only on real change makes the
+        // echo chain terminate deterministically.
+        let prior_size = self.size;
+        let mut prior_splits = Vec::new();
+        if let Some(root) = self.pane.as_ref() {
+            collect_split_sizes(root, &mut prior_splits);
+        }
+
         if let Some(root) = self.pane.as_mut() {
             if let Some(size) = compute_size(root) {
                 self.size = size;
             }
         }
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+
+        let mut new_splits = Vec::new();
+        if let Some(root) = self.pane.as_ref() {
+            collect_split_sizes(root, &mut new_splits);
+        }
+
+        if self.size != prior_size || new_splits != prior_splits {
+            Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        }
     }
 
     fn resize_split_by(&mut self, split_index: usize, delta: isize) {
