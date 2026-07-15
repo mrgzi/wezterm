@@ -22,7 +22,7 @@ use termwiz::color::AnsiColor;
 use termwiz::image::{ImageCell, ImageData};
 use termwiz::surface::{SequenceNo, SEQ_ZERO};
 use url::Url;
-use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
+use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex, TerminalSize};
 
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const BASE_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -69,6 +69,12 @@ pub struct RenderableInner {
     pub title: String,
     pub working_dir: Option<Url>,
     pub seqno: SequenceNo,
+    /// Termob fork (min-grid): the last size this client REPORTED via
+    /// `ClientPane::resize`. Under the min-grid model the report is a
+    /// capacity, not the adopted size, so `dimensions` (authoritative
+    /// minimum from render deltas) can no longer serve as the dedupe key
+    /// for outgoing Resize PDUs.
+    pub last_requested_size: Option<TerminalSize>,
 
     fetch_limiter: RateLimiter,
 
@@ -117,6 +123,7 @@ impl RenderableInner {
             last_input_rtt: 0,
             input_serial: InputSerial::empty(),
             seqno: SEQ_ZERO,
+            last_requested_size: None,
         }
     }
 
@@ -349,7 +356,29 @@ impl RenderableInner {
         {
             self.cursor_position = delta.cursor_position;
         }
-        self.dimensions = delta.dimensions;
+        // Termob fork: guard dimensions against stale deltas. Render deltas
+        // are applied asynchronously; after a burst of resizes an older
+        // in-flight delta can arrive last and would otherwise overwrite the
+        // dimensions with a stale size (visible as the pane snapping back to
+        // an old size on the client that did not perform the resize).
+        // Deltas carry the pane's monotonic seqno (a server-side pane resize
+        // increments it), so only accept dimensions from a delta that is at
+        // least as new as what we already applied.
+        if delta.seqno >= self.seqno {
+            let size_changed = self.dimensions.cols != delta.dimensions.cols
+                || self.dimensions.viewport_rows != delta.dimensions.viewport_rows;
+            self.dimensions = delta.dimensions;
+            // Termob fork (min-grid): the line-cache flush that upstream did
+            // in ClientPane::resize (per outgoing report) lives here instead:
+            // a REAL size change reflows the server-side scrollback, which
+            // remaps StableRowIndex values — cached rows keyed by stable row
+            // would show stale content at wrong positions. Flushing only when
+            // the authoritative size actually changes (instead of per report)
+            // removes the refetch flood during window drags.
+            if size_changed {
+                self.make_all_stale();
+            }
+        }
         self.title = delta.title;
         self.working_dir = delta.working_dir.map(Into::into);
         log::trace!(
@@ -358,7 +387,9 @@ impl RenderableInner {
             delta.seqno,
             self.local_pane_id
         );
-        self.seqno = delta.seqno;
+        // Keep the high-water mark monotonic: a stale delta must not roll
+        // seqno backwards, or the next stale delta would pass the guard.
+        self.seqno = self.seqno.max(delta.seqno);
 
         let config = configuration();
         for (stable_row, line) in bonus_lines {

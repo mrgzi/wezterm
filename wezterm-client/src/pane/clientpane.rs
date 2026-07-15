@@ -390,21 +390,21 @@ impl Pane for ClientPane {
         let render = self.renderable.lock();
         let mut inner = render.inner.borrow_mut();
 
-        let cols = size.cols as usize;
-        let rows = size.rows as usize;
-
-        if inner.dimensions.cols != cols
-            || inner.dimensions.viewport_rows != rows
-            || inner.dimensions.pixel_width != size.pixel_width
-            || inner.dimensions.pixel_height != size.pixel_height
-        {
-            inner.dimensions.cols = cols;
-            inner.dimensions.viewport_rows = rows;
-            inner.dimensions.pixel_width = size.pixel_width;
-            inner.dimensions.pixel_height = size.pixel_height;
-
-            // Invalidate any cached rows on a resize
-            inner.make_all_stale();
+        // Termob fork (min-grid): a client-side resize is a CAPACITY REPORT.
+        // The server computes the pane's effective size as the element-wise
+        // minimum across all clients' reports, so the size we send is NOT
+        // necessarily the size the pane will adopt. Consequently:
+        // - do NOT predictively overwrite `dimensions` (they would flap
+        //   between our capacity and the authoritative minimum on every
+        //   report — visible as the grid jittering between client sizes);
+        // - do NOT flush the line cache here (upstream's make_all_stale per
+        //   report caused a refetch flood during window drags); the cache is
+        //   flushed in `apply_changes_to_surface` when a render delta shows
+        //   the dimensions actually changed.
+        // Dedupe on the last size we reported, since we can no longer use
+        // `dimensions` (it now tracks the authoritative minimum).
+        if inner.last_requested_size != Some(size) {
+            inner.last_requested_size = Some(size);
 
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;

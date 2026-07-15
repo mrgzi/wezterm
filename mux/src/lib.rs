@@ -129,8 +129,34 @@ pub struct Mux {
     clients: RwLock<HashMap<ClientId, ClientInfo>>,
     identity: RwLock<Option<Arc<ClientId>>>,
     num_panes_by_workspace: RwLock<HashMap<String, usize>>,
+    /// Termob fork (min-grid): the size each attached client last requested
+    /// for each pane, recorded by the mux server's Resize PDU handler. A
+    /// client's Resize is treated as a CAPACITY REPORT ("I can display this
+    /// much"), not an authoritative size: the pane's effective size is the
+    /// element-wise minimum across all reporting clients, so every client
+    /// can always display the whole grid (tmux "smallest client" model).
+    /// The minimum is commutative — the effective size is independent of
+    /// the order reports arrive in, which makes concurrent resizes from
+    /// multiple clients deterministic (no last-writer races). Entries are
+    /// dropped when the client unregisters or the pane is removed.
+    client_pane_sizes: RwLock<HashMap<PaneId, HashMap<ClientId, TerminalSize>>>,
     main_thread_id: std::thread::ThreadId,
     agent: Option<AgentProxy>,
+}
+
+/// Element-wise minimum of the given sizes (cols, rows, pixel dims, dpi).
+/// Returns `None` for an empty iterator.
+fn min_terminal_size<'a>(
+    mut sizes: impl Iterator<Item = &'a TerminalSize>,
+) -> Option<TerminalSize> {
+    let first = *sizes.next()?;
+    Some(sizes.fold(first, |acc, s| TerminalSize {
+        rows: acc.rows.min(s.rows),
+        cols: acc.cols.min(s.cols),
+        pixel_width: acc.pixel_width.min(s.pixel_width),
+        pixel_height: acc.pixel_height.min(s.pixel_height),
+        dpi: acc.dpi.min(s.dpi),
+    }))
 }
 
 const BUFSIZE: usize = 1024 * 1024;
@@ -464,6 +490,7 @@ impl Mux {
             clients: RwLock::new(HashMap::new()),
             identity: RwLock::new(None),
             num_panes_by_workspace: RwLock::new(HashMap::new()),
+            client_pane_sizes: RwLock::new(HashMap::new()),
             main_thread_id: std::thread::current().id(),
             agent,
         }
@@ -705,6 +732,75 @@ impl Mux {
 
     pub fn unregister_client(&self, client_id: &ClientId) {
         self.clients.write().remove(client_id);
+        self.forget_client_pane_sizes(client_id);
+    }
+
+    /// Termob fork (min-grid): record `client_id`'s desired size for
+    /// `pane_id` and return the pane's effective size — the element-wise
+    /// minimum across every client that reported one (see the
+    /// `client_pane_sizes` field docs). Called by the mux server's Resize
+    /// PDU handler; the caller applies the returned size to the pane.
+    pub fn record_client_pane_size(
+        &self,
+        client_id: &ClientId,
+        pane_id: PaneId,
+        size: TerminalSize,
+    ) -> TerminalSize {
+        let mut sizes = self.client_pane_sizes.write();
+        let per_pane = sizes.entry(pane_id).or_default();
+        per_pane.insert(client_id.clone(), size);
+        // Non-empty by construction (we just inserted).
+        min_terminal_size(per_pane.values()).unwrap_or(size)
+    }
+
+    /// Termob fork (min-grid): drop `client_id`'s recorded sizes and
+    /// re-apply the new minimum to any pane whose effective size changed —
+    /// when the smallest client disconnects, the survivors' panes grow back
+    /// without waiting for them to re-report. The re-apply is scheduled on
+    /// the main thread: unregister runs from the session's Drop on its I/O
+    /// thread, and pane/tab mutation is a main-thread affair.
+    fn forget_client_pane_sizes(&self, client_id: &ClientId) {
+        let mut changed: Vec<(PaneId, TerminalSize)> = vec![];
+        {
+            let mut sizes = self.client_pane_sizes.write();
+            sizes.retain(|pane_id, per_pane| {
+                let old = min_terminal_size(per_pane.values());
+                if per_pane.remove(client_id).is_some() {
+                    if let Some(new) = min_terminal_size(per_pane.values()) {
+                        if Some(new) != old {
+                            changed.push((*pane_id, new));
+                        }
+                    }
+                }
+                !per_pane.is_empty()
+            });
+        }
+        if changed.is_empty() {
+            return;
+        }
+        promise::spawn::spawn_into_main_thread(async move {
+            let mux = Mux::get();
+            for (pane_id, size) in changed {
+                if let Some(pane) = mux.get_pane(pane_id) {
+                    let dims = pane.get_dimensions();
+                    if dims.cols != size.cols || dims.viewport_rows != size.rows {
+                        if let Err(err) = pane.resize(size) {
+                            log::error!(
+                                "min-grid: failed to re-apply size to pane {pane_id}: {err:#}"
+                            );
+                        }
+                    }
+                }
+            }
+            // Tab totals follow the pane sizes; rebuild notifies TabResized
+            // only on real change (termob fork), so this is quiet when
+            // nothing moved.
+            let tabs: Vec<Arc<Tab>> = mux.tabs.read().values().map(Arc::clone).collect();
+            for tab in tabs {
+                tab.rebuild_splits_sizes_from_contained_panes();
+            }
+        })
+        .detach();
     }
 
     pub fn subscribe<F>(&self, subscriber: F)
@@ -893,6 +989,9 @@ impl Mux {
 
     fn remove_pane_internal(&self, pane_id: PaneId) {
         log::debug!("removing pane {}", pane_id);
+        // Termob fork (min-grid): the pane's per-client size reports die
+        // with the pane.
+        self.client_pane_sizes.write().remove(&pane_id);
         let mut changed = false;
         if let Some(pane) = self.panes.write().remove(&pane_id).clone() {
             log::debug!("killing pane {}", pane_id);

@@ -679,6 +679,16 @@ impl SessionHandler {
                 pane_id,
                 size,
             }) => {
+                // Termob fork (min-grid): a client's Resize is a CAPACITY
+                // report, not an authoritative size. The pane adopts the
+                // element-wise minimum across all reporting clients (tmux
+                // "smallest client" model) — every client can then always
+                // display the whole grid, and concurrent resizes from
+                // different clients converge to the same size regardless of
+                // arrival order (min is commutative; no last-writer race).
+                // Clients without an identity (no SetClientId) keep the
+                // upstream direct-apply behavior.
+                let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
@@ -686,7 +696,18 @@ impl SessionHandler {
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.resize(size)?;
+                            let effective = match client_id.as_deref() {
+                                Some(id) => mux.record_client_pane_size(id, pane_id, size),
+                                None => size,
+                            };
+                            // Idempotence guard: reports that do not move the
+                            // minimum must not re-trigger a PTY resize/reflow
+                            // (a dragging client that is not the minimum would
+                            // otherwise reflow the server per report).
+                            let dims = pane.get_dimensions();
+                            if dims.cols != effective.cols || dims.viewport_rows != effective.rows {
+                                pane.resize(effective)?;
+                            }
                             let tab = mux
                                 .get_tab(containing_tab_id)
                                 .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
