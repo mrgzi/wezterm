@@ -10,10 +10,10 @@ use futures::FutureExt;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::DomainId;
-use mux::MuxNotification;
 use mux::pane::PaneId;
 use mux::ssh::ssh_connect_with_ui;
 use mux::Mux;
+use mux::MuxNotification;
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use portable_pty::Child;
@@ -50,6 +50,8 @@ enum ReaderMessage {
         promise: Sender<anyhow::Result<Pdu>>,
     },
     Readable,
+    /// Termob fork: the keepalive timer fired (see client_thread_async).
+    KeepaliveTick,
 }
 
 #[derive(Clone)]
@@ -404,13 +406,76 @@ async fn client_thread_async(
 
     let mut stream = reconnectable.take_stream().unwrap();
 
+    // Termob fork: application-level keepalive. The socket read/write
+    // timeouts configured at connect time are dead once the stream is
+    // switched to non-blocking (Async::new), and there is no OS keepalive,
+    // so a silent half-close (mobile roaming, NAT timeout) would hang this
+    // loop forever waiting for readability. When the connection has been
+    // idle for PING_INTERVAL we send a Ping; if nothing at all arrives
+    // within PONG_TIMEOUT after that, the connection is declared dead so
+    // the reconnect logic in Client::new can take over. Any inbound data
+    // counts as liveness (cheaper than tracking the specific Pong).
+    const PING_INTERVAL: Duration = Duration::from_secs(15);
+    const PONG_TIMEOUT: Duration = Duration::from_secs(10);
+    // Local (unix-socket) connections can't suffer a roaming half-close and
+    // aren't reconnectable anyway — don't wake up every 15s for them.
+    let keepalive_enabled = !reconnectable.is_local();
+    let mut last_activity = std::time::Instant::now();
+    // `awaiting_pong`: a keepalive ping went out and no data of any kind has
+    // arrived since — the next timer expiry declares the connection dead.
+    let mut awaiting_pong = false;
+    // Serials of keepalive pings whose Pong hasn't arrived yet. Keepalive
+    // responses are deliberately NOT routed through `promises.map`: a promise
+    // whose receiver has gone away is treated as ClientWasDestroyed by the
+    // dispatch below, so parking a ping there would turn a merely *delayed*
+    // Pong into a permanent, non-reconnectable teardown. Instead the ping is
+    // sent bare and its response is consumed here by serial. Entries are
+    // pruned when answered; responses arrive in order on the single stream,
+    // so consuming serial S also retires every older outstanding ping.
+    let mut outstanding_pings: Vec<u64> = Vec::new();
+
     loop {
         let rx_msg = rx.recv();
         let wait_for_read = stream
             .wait_for_readable()
             .map(|_| Ok(ReaderMessage::Readable));
+        let idle_budget = if awaiting_pong {
+            PONG_TIMEOUT
+        } else {
+            PING_INTERVAL
+        };
+        let deadline = last_activity + idle_budget;
+        let keepalive_timer = async {
+            if keepalive_enabled {
+                smol::Timer::at(deadline).await;
+            } else {
+                smol::future::pending::<()>().await;
+            }
+            Ok(ReaderMessage::KeepaliveTick)
+        };
 
-        match smol::future::or(rx_msg, wait_for_read).await {
+        match smol::future::or(smol::future::or(rx_msg, wait_for_read), keepalive_timer).await {
+            Ok(ReaderMessage::KeepaliveTick) => {
+                if awaiting_pong {
+                    promises.fail_all("connection timed out (no response to keepalive ping)");
+                    bail!(
+                        "connection timed out: no data received for {:?} after keepalive ping",
+                        PONG_TIMEOUT
+                    );
+                }
+                let serial = next_serial;
+                next_serial += 1;
+                outstanding_pings.push(serial);
+                awaiting_pong = true;
+                Pdu::Ping(Ping {})
+                    .encode_async(&mut stream, serial)
+                    .await
+                    .context("encoding keepalive ping")?;
+                stream.flush().await.context("flushing keepalive ping")?;
+                // Restart the idle clock so PONG_TIMEOUT is measured from the
+                // moment the ping was sent.
+                last_activity = std::time::Instant::now();
+            }
             Ok(ReaderMessage::SendPdu { pdu, promise }) => {
                 let serial = next_serial;
                 next_serial += 1;
@@ -422,6 +487,9 @@ async fn client_thread_async(
                 stream.flush().await.context("flushing PDU to server")?;
             }
             Ok(ReaderMessage::Readable) => {
+                // Any inbound data proves the connection is alive.
+                last_activity = std::time::Instant::now();
+                awaiting_pong = false;
                 match Pdu::decode_async(&mut stream, Some(next_serial)).await {
                     Ok(decoded) => {
                         log::debug!(
@@ -429,7 +497,15 @@ async fn client_thread_async(
                             decoded.serial,
                             decoded.pdu.pdu_name()
                         );
-                        if decoded.serial == 0 {
+                        if let Some(pos) = outstanding_pings
+                            .iter()
+                            .position(|serial| *serial == decoded.serial)
+                        {
+                            // A keepalive answered. Responses arrive in order,
+                            // so any older outstanding pings will never be
+                            // answered separately — retire them too.
+                            outstanding_pings.drain(..=pos);
+                        } else if decoded.serial == 0 {
                             process_unilateral(local_domain_id, decoded)
                                 .context("processing unilateral PDU from server")
                                 .map_err(|e| {
@@ -1089,9 +1165,22 @@ impl Client {
 
                     if let Some(ioerr) = e.root_cause().downcast_ref::<std::io::Error>() {
                         if let std::io::ErrorKind::UnexpectedEof = ioerr.kind() {
-                            // Don't reconnect for a simple EOF
-                            log::error!("server closed connection ({})", e);
-                            break;
+                            // Termob fork: upstream treated a plain EOF as a
+                            // deliberate server-side close and gave up. On
+                            // mobile, the single most common failure mode is a
+                            // silent half-close while roaming between networks
+                            // (Wi-Fi <-> cellular): the TLS read returns 0,
+                            // decoding fails with UnexpectedEof, and upstream
+                            // would never reconnect even for a reconnectable
+                            // domain. Reconnect instead; a genuinely destroyed
+                            // client still stops via NotReconnectableError
+                            // below, and a permanently gone server just keeps
+                            // the existing capped backoff until the domain is
+                            // detached.
+                            log::error!(
+                                "server closed connection ({}); will attempt to reconnect",
+                                e
+                            );
                         }
                     }
 
