@@ -158,9 +158,16 @@ fn run() -> anyhow::Result<()> {
 
     let cmd = build_command(opts.prog, opts.cwd);
 
+    // Install the promise schedulers *before* the listeners start accepting.
+    // `spawn_listeners` immediately hands connections to `spawn_into_main_thread`,
+    // which panics if no scheduler is configured yet — a client (or a readiness
+    // probe that merely opens the socket) landing in that window is enough to
+    // trigger it. Harmless here because the panic unwinds on a listener thread,
+    // but fatal for embedders built with `panic = "abort"`.
+    let executor = wezterm_mux_server::create_executor();
     wezterm_mux_server::init_mux()?;
     wezterm_mux_server::spawn_listeners(true)?;
-    wezterm_mux_server::run_executor_loop(cmd)
+    wezterm_mux_server::run_executor_loop_with(executor, cmd)
 }
 
 fn build_command(prog: Vec<OsString>, cwd: Option<OsString>) -> Option<CommandBuilder> {

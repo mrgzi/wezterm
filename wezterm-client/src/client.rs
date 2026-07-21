@@ -62,6 +62,18 @@ pub struct Client {
     client_domain_config: ClientDomainConfig,
     pub is_reconnectable: bool,
     pub is_local: bool,
+    /// Termob fork: is the transport currently carrying traffic?
+    ///
+    /// `Domain::state()` cannot answer this. It reports `Attached` for as long
+    /// as the domain holds a `ClientInner`, which stays true throughout a
+    /// disconnect: the reader thread drops into the reconnect loop but the
+    /// domain is untouched. A frontend that wants to tell the user "this tab
+    /// lost its connection" therefore has nothing to read.
+    ///
+    /// Set to `false` when `client_thread` returns an error, back to `true`
+    /// once a reconnect succeeds, and left `false` when the loop gives up.
+    /// Owned by the reader thread; readers only observe.
+    connection_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -1148,14 +1160,22 @@ impl Client {
         let is_local = reconnectable.is_local();
         let (sender, mut receiver) = unbounded();
         let client_id = ClientId::new();
+        // Termob fork: see `Client::connection_live`.
+        let connection_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let thread_connection_live = std::sync::Arc::clone(&connection_live);
 
         thread::spawn(move || {
+            use std::sync::atomic::Ordering;
             const BASE_INTERVAL: Duration = Duration::from_secs(1);
             const MAX_INTERVAL: Duration = Duration::from_secs(10);
 
             let mut backoff = BASE_INTERVAL;
             loop {
                 if let Err(e) = client_thread(&mut reconnectable, local_domain_id, &mut receiver) {
+                    // Termob fork: the transport is down from here on. Flag it
+                    // before any of the give-up branches below so a frontend
+                    // never sees a live flag on a dead connection.
+                    thread_connection_live.store(false, Ordering::Relaxed);
                     if !reconnectable.reconnectable() || local_domain_id.is_none() {
                         log::debug!("client thread ended: {}", e);
                         break;
@@ -1203,6 +1223,8 @@ impl Client {
                         match reconnectable.connect(initial, &mut ui, no_auto_start) {
                             Ok(_) => {
                                 backoff = BASE_INTERVAL;
+                                // Termob fork: transport is carrying traffic again.
+                                thread_connection_live.store(true, Ordering::Relaxed);
                                 log::error!("Reconnected!");
                                 promise::spawn::spawn_into_main_thread(async move {
                                     ClientDomain::reattach(local_domain_id, ui).await.ok();
@@ -1220,6 +1242,9 @@ impl Client {
                         }
                     }
                 } else {
+                    // Termob fork: no error, but the reader loop is over — the
+                    // transport is not carrying traffic any more either.
+                    thread_connection_live.store(false, Ordering::Relaxed);
                     log::error!("client_thread returned without any error condition");
                     break;
                 }
@@ -1255,7 +1280,19 @@ impl Client {
             is_local,
             client_id,
             client_domain_config,
+            connection_live,
         }
+    }
+
+    /// Termob fork: is the transport currently carrying traffic?
+    ///
+    /// See [`Client::connection_live`] for why `Domain::state()` cannot be
+    /// used for this. A `false` result means the reader thread hit an error;
+    /// whether it will come back depends on [`Client::is_reconnectable`]
+    /// (reconnectable domains retry with a capped backoff, others stay down).
+    pub fn is_connection_live(&self) -> bool {
+        self.connection_live
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn into_client_domain_config(self) -> ClientDomainConfig {

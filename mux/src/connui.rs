@@ -44,6 +44,15 @@ pub enum UIRequest {
     Input {
         prompt: String,
         echo: bool,
+        /// Typed provenance for what this prompt refers to, when the caller
+        /// has it (see [`ConnectionUI::input_with_context`]). Host-key
+        /// verification passes the client-computed host/fingerprint message
+        /// here so an embedded responder does not have to recover it from the
+        /// accumulated `Output` stream, where it would sit next to
+        /// server-controlled text such as the SSH banner — which arrives
+        /// *before* verification and could spoof a fingerprint-looking line.
+        /// Terminal-overlay and headless impls ignore this field.
+        context: Option<String>,
         respond: Promise<String>,
     },
     /// Sleep with a progress bar
@@ -76,6 +85,7 @@ impl ConnectionUIImpl {
                     prompt,
                     echo: true,
                     mut respond,
+                    ..
                 }) => {
                     respond.result(self.input_prompt(&prompt));
                 }
@@ -83,6 +93,7 @@ impl ConnectionUIImpl {
                     prompt,
                     echo: false,
                     mut respond,
+                    ..
                 }) => {
                     respond.result(self.password_prompt(&prompt));
                 }
@@ -241,7 +252,16 @@ impl HeadlessImpl {
 /// without opening a terminal-overlay window.
 struct ResponderImpl {
     rx: Receiver<UIRequest>,
-    responder: Box<dyn Fn(&str, bool) -> Option<String> + Send + 'static>,
+    responder: Box<dyn Fn(&str, bool, &str) -> Option<String> + Send + 'static>,
+    /// Text emitted via `UIRequest::Output` since the last `Input` prompt.
+    ///
+    /// Fallback context for prompts that carry no typed `context` field
+    /// (e.g. keyboard-interactive instructions): without it an embedded
+    /// responder would answer with no idea what the prompt refers to.
+    /// Host-key verification does NOT rely on this buffer any more — its
+    /// fingerprint message travels typed in `UIRequest::Input::context`, so
+    /// the server-controlled banner buffered here cannot spoof it.
+    pending_output: String,
 }
 
 impl ResponderImpl {
@@ -250,14 +270,31 @@ impl ResponderImpl {
             match self.rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(UIRequest::Close) => break,
                 Ok(UIRequest::Output(changes)) => {
+                    for change in &changes {
+                        if let Change::Text(text) = change {
+                            self.pending_output.push_str(text);
+                        }
+                    }
                     log::trace!("Output: {:?}", changes);
                 }
                 Ok(UIRequest::Input {
                     prompt,
                     echo,
+                    context,
                     mut respond,
                 }) => {
-                    let answer = (self.responder)(&prompt, echo);
+                    // Prefer the TYPED context when the caller supplied one
+                    // (host-key verification passes the client-computed
+                    // fingerprint message) and DISCARD the buffered output for
+                    // that prompt: the buffer is untyped and may contain
+                    // server-controlled text (the SSH banner arrives before
+                    // verification), which could spoof an extra
+                    // fingerprint-looking line above the real one. The buffer
+                    // remains the fallback for prompts without typed context
+                    // (e.g. keyboard-interactive instructions).
+                    let buffered = std::mem::take(&mut self.pending_output);
+                    let context = context.unwrap_or(buffered);
+                    let answer = (self.responder)(&prompt, echo, &context);
                     match answer {
                         Some(s) => respond.result(Ok(s)),
                         None => respond.result(Err(anyhow!(
@@ -348,18 +385,36 @@ impl ConnectionUI {
     /// terminal overlay. Used by embedded hosts (mobile, GUI) to feed
     /// SSH auth answers from a modal / keychain.
     ///
-    /// `responder` receives `(prompt, echo)` and returns the answer, or
-    /// `None` to fail the prompt (caller-cancelled). `echo == false`
+    /// `responder` receives `(prompt, echo, context)` and returns the answer,
+    /// or `None` to fail the prompt (caller-cancelled). `echo == false`
     /// means it is a password/passphrase prompt.
+    ///
+    /// `context` has two sources, in order of preference:
+    ///
+    /// 1. **Typed** — the prompt was issued via
+    ///    [`ConnectionUI::input_with_context`]. Host-key verification passes
+    ///    the client-computed host/fingerprint message
+    ///    (`HostVerificationEvent::message`, composed by `wezterm-ssh` from
+    ///    the key the server actually offered). Server-controlled text such
+    ///    as the SSH banner CANNOT mix into this value.
+    /// 2. **Buffered fallback** — everything this UI emitted since the
+    ///    previous prompt, for prompts without a typed context (e.g.
+    ///    keyboard-interactive instructions). This is untyped and may contain
+    ///    server-supplied text; a responder that shows it to a human must
+    ///    present it verbatim as untrusted server output.
+    ///
+    /// The buffer is cleared on every prompt either way, so a banner never
+    /// leaks into a later prompt's context.
     pub fn new_with_input_responder<F>(responder: F) -> Self
     where
-        F: Fn(&str, bool) -> Option<String> + Send + 'static,
+        F: Fn(&str, bool, &str) -> Option<String> + Send + 'static,
     {
         let (tx, rx) = unbounded();
         std::thread::spawn(move || {
             let mut ui = ResponderImpl {
                 rx,
                 responder: Box::new(responder),
+                pending_output: String::new(),
             };
             ui.run()
         });
@@ -441,6 +496,22 @@ impl ConnectionUI {
     }
 
     pub fn input(&self, prompt: &str) -> anyhow::Result<String> {
+        self.input_impl(prompt, None)
+    }
+
+    /// Like [`Self::input`], but also carries a typed `context` describing
+    /// what the prompt refers to. SSH host-key verification passes the
+    /// client-computed host/fingerprint message here so an embedded responder
+    /// (see [`Self::new_with_input_responder`]) receives it separately from
+    /// the accumulated `Output` stream — that stream also carries
+    /// server-controlled text (the SSH banner, printed *before* verification),
+    /// which could otherwise spoof a fingerprint-looking line. Terminal
+    /// overlay and headless UIs ignore the context.
+    pub fn input_with_context(&self, prompt: &str, context: &str) -> anyhow::Result<String> {
+        self.input_impl(prompt, Some(context.to_string()))
+    }
+
+    fn input_impl(&self, prompt: &str, context: Option<String>) -> anyhow::Result<String> {
         let mut promise = Promise::new();
         let future = promise.get_future().unwrap();
 
@@ -453,6 +524,7 @@ impl ConnectionUI {
             .send(UIRequest::Input {
                 prompt,
                 echo: true,
+                context,
                 respond: promise,
             })
             .context("send to ConnectionUI failed")?;
@@ -473,6 +545,7 @@ impl ConnectionUI {
             .send(UIRequest::Input {
                 prompt,
                 echo: false,
+                context: None,
                 respond: promise,
             })
             .context("send to ConnectionUI failed")?;

@@ -175,20 +175,52 @@ pub async fn async_run_mux(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Handle returned by [`create_executor`] and consumed by
+/// [`run_executor_loop_with`]. Re-exported so embedders can name the type
+/// without depending on `promise` directly.
+pub use promise::spawn::SimpleExecutor;
+
+/// Install the promise schedulers, without running the loop.
+///
+/// **Call this before [`spawn_listeners`] if the two are not adjacent.** A
+/// listener thread calls `spawn_into_main_thread` for *every* accepted
+/// connection (see `wezterm-mux-server-impl`'s `LocalListener::run`), and that
+/// panics with "no scheduler has been configured" when the schedulers are not
+/// installed yet. `spawn_listeners` starts those threads immediately, so a
+/// client connecting before the loop starts hits the window — a readiness probe
+/// that merely opens the socket is enough to trigger it. Embedders built with
+/// `panic = "abort"` lose the entire process to that panic.
+///
+/// Creating the executor early is safe: the queue is unbounded, so work spawned
+/// before [`run_executor_loop_with`] starts is not dropped — it is drained on
+/// the first tick.
+pub fn create_executor() -> promise::spawn::SimpleExecutor {
+    promise::spawn::SimpleExecutor::new()
+}
+
 /// Spawn the async mux bootstrap as a task and run the promise executor
 /// loop forever. This function never returns normally.
+///
+/// Installs the schedulers itself; use [`create_executor`] +
+/// [`run_executor_loop_with`] when listeners must be spawned first.
 pub fn run_executor_loop(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
-    let executor = promise::spawn::SimpleExecutor::new();
+    run_executor_loop_with(create_executor(), cmd)
+}
 
+/// [`run_executor_loop`] with an executor already built by [`create_executor`].
+pub fn run_executor_loop_with(
+    executor: promise::spawn::SimpleExecutor,
+    cmd: Option<CommandBuilder>,
+) -> anyhow::Result<()> {
     let activity = Activity::new();
     // `spawn_local_inline` enqueues the `!Send` mux bootstrap future (mux
     // `Rc<Lua>` config callbacks are `!Send`) onto the main-thread local
     // executor; it is POLLED on this thread by `executor.tick()` below (never
     // inline on a waking thread). This is the fork's dedicated entry for
     // `!Send` futures (the plain `spawn` requires `Send` because termob's
-    // promise tick thread is separate). `SimpleExecutor::new` above already
-    // installed the doorbell, so cross-thread wakes (e.g. `smol::Timer`) drive
-    // the loop here.
+    // promise tick thread is separate). Constructing the `executor` argument
+    // already installed the doorbell (see `create_executor`), so cross-thread
+    // wakes (e.g. `smol::Timer`) drive the loop here.
     promise::spawn::spawn_local_inline(async move {
         if let Err(err) = async_run_mux(cmd).await {
             log::error!("{:#}; terminating", err);
