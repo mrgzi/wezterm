@@ -14,7 +14,8 @@ use mux::pane::PaneId;
 use mux::ssh::ssh_connect_with_ui;
 use mux::Mux;
 use mux::MuxNotification;
-use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
+use openssl::pkey::PKey;
+use openssl::ssl::{SslConnector, SslMethod};
 use openssl::x509::X509;
 use portable_pty::Child;
 use smol::channel::{bounded, unbounded, Receiver, Sender};
@@ -1065,37 +1066,86 @@ impl Reconnectable {
     ) -> anyhow::Result<Box<dyn AsyncReadAndWrite>> {
         let mut connector = SslConnector::builder(SslMethod::tls())?;
 
+        // Credentials are read into memory by us and handed to OpenSSL as
+        // in-memory objects, rather than using the `*_file` helpers.
+        //
+        // The `*_file` helpers go through `BIO_new_file`, which does not exist
+        // when OpenSSL is built with `no-stdio`. The `openssl-src` crate passes
+        // `no-stdio` for every Android target, so on Android
+        // `SSL_CTX_use_certificate_file` can never succeed: it fails with
+        // `BIO_new_ex:init fail` even when the file exists and is readable.
+        // Reading the bytes ourselves and parsing them with the memory-BIO
+        // based `X509::from_pem` / `X509::stack_from_pem` /
+        // `PKey::private_key_from_pem` works on every platform (see `load_cert`
+        // below, which already took this route).
+        //
+        // This is a portability fix only: all three conversions below
+        // (`set_certificate_file`, `set_certificate_chain_file`,
+        // `set_private_key_file`) keep their original semantics, including the
+        // fact that a `pem_ca` chain overrides the leaf set from `pem_cert`.
         let cert_file = match tls_client.pem_cert.clone() {
             Some(cert) => cert,
             None => self.tls_creds_cert_path()?,
         };
 
-        connector
-            .set_certificate_file(&cert_file, SslFiletype::PEM)
-            .context(format!(
-                "set_certificate_file to {} for TLS client",
-                cert_file.display()
-            ))?;
+        let cert = load_cert(&cert_file).context(format!(
+            "loading certificate {} for TLS client",
+            cert_file.display()
+        ))?;
+        connector.set_certificate(&cert).context(format!(
+            "set_certificate from {} for TLS client",
+            cert_file.display()
+        ))?;
 
         if let Some(chain_file) = tls_client.pem_ca.as_ref() {
-            connector
-                .set_certificate_chain_file(&chain_file)
+            // In-memory equivalent of `set_certificate_chain_file`, with the
+            // same semantics: the file's first certificate becomes the leaf
+            // (overriding the one set just above, exactly as the OpenSSL API
+            // does) and the remaining ones are sent as the chain.
+            let chain_bytes = std::fs::read(chain_file).context(format!(
+                "reading certificate chain {} for TLS client",
+                chain_file.display()
+            ))?;
+            let mut chain = X509::stack_from_pem(&chain_bytes)
                 .context(format!(
-                    "set_certificate_chain_file to {} for TLS client",
+                    "parsing certificate chain {} for TLS client",
+                    chain_file.display()
+                ))?
+                .into_iter();
+            let Some(leaf) = chain.next() else {
+                bail!(
+                    "certificate chain {} contains no certificates",
+                    chain_file.display()
+                );
+            };
+            connector.set_certificate(&leaf).context(format!(
+                "set_certificate from chain {} for TLS client",
+                chain_file.display()
+            ))?;
+            for extra in chain {
+                connector.add_extra_chain_cert(extra).context(format!(
+                    "add_extra_chain_cert from {} for TLS client",
                     chain_file.display()
                 ))?;
+            }
         }
 
         let key_file = match tls_client.pem_private_key.clone() {
             Some(key) => key,
             None => self.tls_creds_cert_path()?,
         };
-        connector
-            .set_private_key_file(&key_file, SslFiletype::PEM)
-            .context(format!(
-                "set_private_key_file to {} for TLS client",
-                key_file.display()
-            ))?;
+        let key_bytes = std::fs::read(&key_file).context(format!(
+            "reading private key {} for TLS client",
+            key_file.display()
+        ))?;
+        let key = PKey::private_key_from_pem(&key_bytes).context(format!(
+            "parsing private key {} for TLS client",
+            key_file.display()
+        ))?;
+        connector.set_private_key(&key).context(format!(
+            "set_private_key from {} for TLS client",
+            key_file.display()
+        ))?;
 
         fn load_cert(name: &Path) -> anyhow::Result<X509> {
             let cert_bytes = std::fs::read(name)?;
