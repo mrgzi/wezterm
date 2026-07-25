@@ -221,7 +221,12 @@ impl Pki {
 /// starting second server or an in-flight reader never observes a
 /// half-written file. `private` additionally restricts the file to
 /// owner-only on unix (for files that carry a private key).
-fn write_atomic(path: &std::path::Path, bytes: &[u8], private: bool) -> anyhow::Result<()> {
+///
+/// Public so that embedders which issue their own credentials next to this
+/// PKI (a client cert re-issued when the CA rotated, for example) write them
+/// under the same guarantees instead of reaching for `std::fs::write`, which
+/// is neither atomic nor owner-only.
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8], private: bool) -> anyhow::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent dir", path.display()))?;

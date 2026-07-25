@@ -66,7 +66,29 @@ pub trait Domain: Downcast + Send + Sync {
 
         let mux = Mux::get();
         mux.add_tab_and_active_pane(&tab)?;
-        mux.add_tab_to_window(&tab, window)?;
+        if let Err(err) = mux.add_tab_to_window(&tab, window) {
+            // Roll back, so that spawn is all-or-nothing.
+            //
+            // `add_tab_and_active_pane` above has already committed the tab and
+            // its pane to the mux registries. `add_tab_to_window` fails when
+            // `window` no longer exists -- which happens for real: a
+            // `prune_dead_windows` that already passed its `Activity::count()`
+            // check can delete the window between the caller picking it and this
+            // line. Without the rollback the tab stays in `mux.tabs` forever,
+            // attached to no window, wrapping a live process: `prune_dead_windows`
+            // only collects empty windows and tabs whose panes have all exited,
+            // so nothing ever reaps it. On a remote domain that orphan is a real
+            // process on the server that the user can neither see nor stop.
+            //
+            // Killing the panes first is what turns the leak into a clean
+            // failure: `LocalPane::kill` signals the child, `ClientPane::kill`
+            // sends the kill PDU to the server.
+            for pos in tab.iter_panes_ignoring_zoom() {
+                pos.pane.kill();
+            }
+            mux.remove_tab(tab.tab_id());
+            return Err(err);
+        }
 
         Ok(tab)
     }
