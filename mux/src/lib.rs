@@ -140,6 +140,27 @@ pub struct Mux {
     /// multiple clients deterministic (no last-writer races). Entries are
     /// dropped when the client unregisters or the pane is removed.
     client_pane_sizes: RwLock<HashMap<PaneId, HashMap<ClientId, TerminalSize>>>,
+    /// Termob fork (exclusive control): the client that EXCLUSIVELY controls a
+    /// pane, if any. While set, that client's capacity report is the pane's
+    /// size and every other client's report is ignored — the pane follows one
+    /// window instead of the smallest one.
+    ///
+    /// Why both models coexist: min-grid ([`Mux::client_pane_sizes`]) keeps a
+    /// shared pane readable on every client, which is right while several
+    /// clients are watching the same shell. But a client that is *driving* a
+    /// pane wants its own geometry (its window is where the work happens), and
+    /// the others cannot render the grid meaningfully anyway once they are not
+    /// following it. So: no authority set -> smallest-client; authority set ->
+    /// that client's size. Entries are dropped when the pane is removed or the
+    /// controlling client unregisters, so the pane falls back to min-grid
+    /// instead of freezing at a departed client's geometry.
+    pane_size_authority: RwLock<HashMap<PaneId, Arc<ClientId>>>,
+    /// Termob fork: notified after a client connection is unregistered, so an
+    /// embedding host can release per-client state it owns outside the mux
+    /// (termob-server frees that client's exclusive pane controls). The mux
+    /// itself has no such state beyond the maps cleaned in
+    /// [`Mux::unregister_client`].
+    client_disconnect_handler: RwLock<Option<Arc<dyn Fn(&ClientId) + Send + Sync>>>,
     main_thread_id: std::thread::ThreadId,
     agent: Option<AgentProxy>,
 }
@@ -491,6 +512,8 @@ impl Mux {
             identity: RwLock::new(None),
             num_panes_by_workspace: RwLock::new(HashMap::new()),
             client_pane_sizes: RwLock::new(HashMap::new()),
+            pane_size_authority: RwLock::new(HashMap::new()),
+            client_disconnect_handler: RwLock::new(None),
             main_thread_id: std::thread::current().id(),
             agent,
         }
@@ -733,6 +756,113 @@ impl Mux {
     pub fn unregister_client(&self, client_id: &ClientId) {
         self.clients.write().remove(client_id);
         self.forget_client_pane_sizes(client_id);
+        // A departed client must not keep owning panes: drop its exclusive
+        // controls so the survivors fall back to the smallest-client model
+        // (otherwise the pane would stay frozen at the geometry of a window
+        // that no longer exists).
+        //
+        // ORDER MATTERS — the authority is dropped BEFORE the embedding host is
+        // notified, never after. In the window between the two steps the mux has
+        // no authority while the host still records the departed client as the
+        // owner: every other client is still holding back its size reports, so
+        // nothing moves and nothing diverges. The reverse order would leave the
+        // host reporting "free" while the mux still routes sizing to a client
+        // that will never report again — the survivors would resize and see
+        // nothing happen.
+        self.release_pane_size_authority_for_client(client_id);
+        let handler = self.client_disconnect_handler.read().clone();
+        if let Some(handler) = handler {
+            handler(client_id);
+        }
+    }
+
+    /// Termob fork: install the client-disconnect handler (see the
+    /// `client_disconnect_handler` field docs). Last writer wins; the embedding
+    /// host installs it once at startup.
+    pub fn set_client_disconnect_handler(
+        &self,
+        handler: Arc<dyn Fn(&ClientId) + Send + Sync>,
+    ) {
+        self.client_disconnect_handler.write().replace(handler);
+    }
+
+    /// Termob fork (exclusive control): make `client_id` the sole size
+    /// authority for `pane_id`, or (with `None`) hand the pane back to the
+    /// smallest-client model. The pane is resized immediately if the effective
+    /// size changed, so the hand-over does not wait for the new owner to
+    /// re-report.
+    pub fn set_pane_size_authority(&self, pane_id: PaneId, client_id: Option<Arc<ClientId>>) {
+        // Lock order is always sizes -> authority (every site that touches both
+        // takes them in this order), never the reverse.
+        let changed = {
+            let sizes = self.client_pane_sizes.read();
+            let mut authority = self.pane_size_authority.write();
+            let previous = match client_id {
+                Some(id) => authority.insert(pane_id, id),
+                None => authority.remove(&pane_id),
+            };
+            let unchanged = match (&previous, authority.get(&pane_id)) {
+                (Some(before), Some(after)) => before == after,
+                (None, None) => true,
+                _ => false,
+            };
+            if unchanged {
+                None
+            } else {
+                sizes
+                    .get(&pane_id)
+                    .and_then(|per_pane| {
+                        Self::effective_size_for(authority.get(&pane_id), per_pane)
+                    })
+                    .map(|size| (pane_id, size))
+            }
+        };
+        if let Some(change) = changed {
+            Self::reapply_pane_sizes(vec![change]);
+        }
+    }
+
+    /// Termob fork (exclusive control): drop every pane authority held by
+    /// `client_id` and re-apply the resulting sizes (min-grid takes over).
+    fn release_pane_size_authority_for_client(&self, client_id: &ClientId) {
+        let mut changed: Vec<(PaneId, TerminalSize)> = vec![];
+        {
+            let sizes = self.client_pane_sizes.read();
+            let mut authority = self.pane_size_authority.write();
+            let dropped: Vec<PaneId> = authority
+                .iter()
+                .filter(|(_, owner)| owner.as_ref() == client_id)
+                .map(|(pane_id, _)| *pane_id)
+                .collect();
+            for pane_id in dropped {
+                authority.remove(&pane_id);
+                if let Some(per_pane) = sizes.get(&pane_id) {
+                    // No authority left for this pane: minimum across reporters.
+                    if let Some(size) = Self::effective_size_for(None, per_pane) {
+                        changed.push((pane_id, size));
+                    }
+                }
+            }
+        }
+        if !changed.is_empty() {
+            Self::reapply_pane_sizes(changed);
+        }
+    }
+
+    /// The size a pane should adopt given its reporters and (optionally) its
+    /// exclusive size authority. An authority that has not reported yet falls
+    /// back to the minimum — a transient state right after a hand-over, and
+    /// the new owner's first report replaces it.
+    fn effective_size_for(
+        authority: Option<&Arc<ClientId>>,
+        per_pane: &HashMap<ClientId, TerminalSize>,
+    ) -> Option<TerminalSize> {
+        if let Some(owner) = authority {
+            if let Some(size) = per_pane.get(owner.as_ref()) {
+                return Some(*size);
+            }
+        }
+        min_terminal_size(per_pane.values())
     }
 
     /// Termob fork (min-grid): record `client_id`'s desired size for
@@ -740,6 +870,11 @@ impl Mux {
     /// minimum across every client that reported one (see the
     /// `client_pane_sizes` field docs). Called by the mux server's Resize
     /// PDU handler; the caller applies the returned size to the pane.
+    ///
+    /// If the pane has an exclusive size authority
+    /// ([`Mux::set_pane_size_authority`]), that client's report wins outright
+    /// and everyone else's is recorded but not applied — a non-owner cannot
+    /// shrink a pane it does not drive.
     pub fn record_client_pane_size(
         &self,
         client_id: &ClientId,
@@ -749,8 +884,9 @@ impl Mux {
         let mut sizes = self.client_pane_sizes.write();
         let per_pane = sizes.entry(pane_id).or_default();
         per_pane.insert(client_id.clone(), size);
+        let authority = self.pane_size_authority.read();
         // Non-empty by construction (we just inserted).
-        min_terminal_size(per_pane.values()).unwrap_or(size)
+        Self::effective_size_for(authority.get(&pane_id), per_pane).unwrap_or(size)
     }
 
     /// Termob fork (min-grid): drop `client_id`'s recorded sizes and
@@ -763,10 +899,12 @@ impl Mux {
         let mut changed: Vec<(PaneId, TerminalSize)> = vec![];
         {
             let mut sizes = self.client_pane_sizes.write();
+            let authority = self.pane_size_authority.read();
             sizes.retain(|pane_id, per_pane| {
-                let old = min_terminal_size(per_pane.values());
+                let owner = authority.get(pane_id);
+                let old = Self::effective_size_for(owner, per_pane);
                 if per_pane.remove(client_id).is_some() {
-                    if let Some(new) = min_terminal_size(per_pane.values()) {
+                    if let Some(new) = Self::effective_size_for(owner, per_pane) {
                         if Some(new) != old {
                             changed.push((*pane_id, new));
                         }
@@ -778,6 +916,16 @@ impl Mux {
         if changed.is_empty() {
             return;
         }
+        Self::reapply_pane_sizes(changed);
+    }
+
+    /// Termob fork: apply recomputed effective sizes to their panes on the main
+    /// thread and rebuild tab totals. Shared by every path that changes a
+    /// pane's effective size without a Resize PDU (a reporter going away, an
+    /// exclusive-control hand-over). Scheduled on the main thread because pane
+    /// and tab mutation is a main-thread affair while the callers run on I/O
+    /// threads.
+    fn reapply_pane_sizes(changed: Vec<(PaneId, TerminalSize)>) {
         promise::spawn::spawn_into_main_thread(async move {
             let mux = Mux::get();
             for (pane_id, size) in changed {
@@ -786,7 +934,7 @@ impl Mux {
                     if dims.cols != size.cols || dims.viewport_rows != size.rows {
                         if let Err(err) = pane.resize(size) {
                             log::error!(
-                                "min-grid: failed to re-apply size to pane {pane_id}: {err:#}"
+                                "failed to re-apply effective size to pane {pane_id}: {err:#}"
                             );
                         }
                     }
@@ -990,8 +1138,9 @@ impl Mux {
     fn remove_pane_internal(&self, pane_id: PaneId) {
         log::debug!("removing pane {}", pane_id);
         // Termob fork (min-grid): the pane's per-client size reports die
-        // with the pane.
+        // with the pane, as does its exclusive size authority.
         self.client_pane_sizes.write().remove(&pane_id);
+        self.pane_size_authority.write().remove(&pane_id);
         let mut changed = false;
         if let Some(pane) = self.panes.write().remove(&pane_id).clone() {
             log::debug!("killing pane {}", pane_id);

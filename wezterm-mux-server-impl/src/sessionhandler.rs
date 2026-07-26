@@ -22,10 +22,17 @@ use wezterm_term::StableRowIndex;
 /// The mux server itself does NOT understand termob's RPC payload — it only
 /// transports it. An embedding host (termob-server) installs this handler via
 /// [`set_termob_channel_handler`]; the handler receives `(pane_id, call_id,
-/// payload)` and returns the opaque response bytes, which the server wraps in a
+/// payload, client_id)` and returns the opaque response bytes, which the server wraps in a
 /// `TermobChannelResponse`. Keeping the schema out of the codec is deliberate:
 /// wezterm stays terminal-only, termob's data model lives in `termob-proto`.
-pub type TermobChannelHandler = dyn Fn(PaneId, u64, Vec<u8>) -> Vec<u8> + Send + Sync;
+/// `client_id` is the identity of the connection the request arrived on (the
+/// same `ClientId` the mux registers for `Resize` capacity reports and
+/// `list-clients`). It is derived from the transport session, NOT from the PDU
+/// body, so the handler can use it for decisions that must not be spoofable by
+/// a patched client — e.g. which client exclusively controls a pane. It is
+/// `None` for connections that never sent `SetClientId`.
+pub type TermobChannelHandler =
+    dyn Fn(PaneId, u64, Vec<u8>, Option<Arc<ClientId>>) -> Vec<u8> + Send + Sync;
 
 static TERMOB_CHANNEL_HANDLER: Mutex<Option<Arc<TermobChannelHandler>>> = Mutex::new(None);
 
@@ -1073,12 +1080,16 @@ impl SessionHandler {
             }) => {
                 let handler = termob_channel_handler();
                 let resp_sender = self.to_write_tx.clone();
+                // Session-authenticated identity of the calling connection —
+                // taken from the session, not from the PDU body, so the handler
+                // can key non-spoofable per-client decisions on it.
+                let client_id = self.client_id.clone();
                 let spawn_result = std::thread::Builder::new()
                     .name("termob-host-call".into())
                     .spawn(move || {
                         let pdu = match handler {
                             Some(h) => {
-                                let reply = h(pane_id, call_id, payload);
+                                let reply = h(pane_id, call_id, payload, client_id);
                                 Pdu::TermobChannelResponse(TermobChannelResponse {
                                     pane_id,
                                     call_id,
