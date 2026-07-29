@@ -1780,8 +1780,26 @@ pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
     Ok(crate::HOME_DIR.join(".local/share/wezterm"))
 }
 
+/// Where the mux PKI (CA, server cert, and the credentials a client fetches
+/// during bootstrap) is stored.
+///
+/// This is *persistent* state, so it deliberately does not live under
+/// `compute_runtime_dir()`. On Linux that resolves to `$XDG_RUNTIME_DIR`
+/// (`/run/user/$UID`), a tmpfs that is wiped on reboot and torn down when the
+/// login session ends (systemd's `RemoveIPC=yes` can pull it out from under a
+/// running daemon). Losing it there regenerates the CA on the next start,
+/// which invalidates every credential already distributed to clients and
+/// defeats the persisted-CA path in `wezterm-mux-server-impl::pki`. Clients
+/// are affected the same way: `Reconnectable::tls_creds_path` keeps bootstrap
+/// results here, so a wipe forces a re-bootstrap on every boot.
+///
+/// The expression is intentionally the same one the other `compute_*_dir`
+/// helpers fall back to, rather than `compute_data_dir()`: on macOS and
+/// Windows `runtime_dir()` is `None`, so this is byte-for-byte the path the
+/// PKI already used and no credential migration is needed. Only Linux moves,
+/// and only off a directory that did not survive a reboot anyway.
 pub fn pki_dir() -> anyhow::Result<PathBuf> {
-    compute_runtime_dir().map(|d| d.join("pki"))
+    Ok(crate::HOME_DIR.join(".local/share/wezterm/pki"))
 }
 
 pub fn default_read_timeout() -> Duration {
@@ -1790,6 +1808,20 @@ pub fn default_read_timeout() -> Duration {
 
 pub fn default_write_timeout() -> Duration {
     Duration::from_secs(60)
+}
+
+/// How long to wait for the TCP handshake when connecting to a TLS domain.
+///
+/// Termob fork: `TcpStream::connect` has no timeout of its own, so an
+/// unreachable-but-not-refusing peer (firewall DROP, stale LAN address, a
+/// phone that roamed off the network) used to block the connecting thread for
+/// the OS SYN-retry budget — around 75s on macOS and 130s on Linux. That is
+/// far longer than a user waits before deciding the app is broken, and it is
+/// the single most common failure mode on mobile. 10s is well above any real
+/// handshake on a slow cellular link while still failing fast enough to be
+/// read as an error rather than a hang.
+pub fn default_connect_timeout() -> Duration {
+    Duration::from_secs(10)
 }
 
 pub fn default_local_echo_threshold_ms() -> Option<u64> {

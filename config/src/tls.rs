@@ -82,6 +82,14 @@ pub struct TlsDomainClient {
     #[dynamic(default = "default_write_timeout")]
     pub write_timeout: Duration,
 
+    /// How long to wait for the TCP handshake before giving up on an address.
+    ///
+    /// Termob fork; `read_timeout`/`write_timeout` only start applying once a
+    /// connection exists, so without this a filtered port hangs for the OS
+    /// SYN-retry budget. See [`default_connect_timeout`].
+    #[dynamic(default = "default_connect_timeout")]
+    pub connect_timeout: Duration,
+
     #[dynamic(default = "default_local_echo_threshold_ms")]
     pub local_echo_threshold_ms: Option<u64>,
 

@@ -37,6 +37,20 @@ impl LineEditorHost for PasswordPromptHost {
     }
 }
 
+/// Context value marking an authentication prompt composed on THIS machine
+/// (a key-file passphrase). A secret answered here never leaves the client.
+///
+/// Termob fork. Paired with [`AUTH_ORIGIN_SERVER`]; both are `const` so the
+/// producer (`mux::ssh`) and the consumer (`termob-core`'s auth responder)
+/// agree on one spelling instead of duplicating a literal that could drift
+/// apart silently. See [`ConnectionUI::password_with_context`].
+pub const AUTH_ORIGIN_LOCAL: &str = "auth-origin:local";
+
+/// Context value marking an authentication prompt RELAYED FROM THE REMOTE
+/// HOST (keyboard-interactive, password auth). Its text is chosen by the
+/// server, so a responder must not answer it with a local-only secret.
+pub const AUTH_ORIGIN_SERVER: &str = "auth-origin:server";
+
 pub enum UIRequest {
     /// Display something
     Output(Vec<Change>),
@@ -52,6 +66,14 @@ pub enum UIRequest {
         /// server-controlled text such as the SSH banner — which arrives
         /// *before* verification and could spoof a fingerprint-looking line.
         /// Terminal-overlay and headless impls ignore this field.
+        ///
+        /// **The meaning depends on `echo`, and a new caller must not mix the
+        /// two.** With `echo = true` it is the host-key fingerprint message
+        /// above; with `echo = false` it is one of
+        /// [`AUTH_ORIGIN_LOCAL`] / [`AUTH_ORIGIN_SERVER`], saying who composed
+        /// a secret prompt (see [`ConnectionUI::password_with_context`]).
+        /// Responders branch on `echo` first, so the two never meet — but a
+        /// third meaning added here would silently collide with one of them.
         context: Option<String>,
         respond: Promise<String>,
     },
@@ -533,6 +555,30 @@ impl ConnectionUI {
     }
 
     pub fn password(&self, prompt: &str) -> anyhow::Result<String> {
+        self.password_impl(prompt, None)
+    }
+
+    /// Like [`Self::password`], but carries a typed `context` describing where
+    /// the prompt came from.
+    ///
+    /// Termob fork, and the reason it exists is a real hole: an embedded
+    /// responder (see [`Self::new_with_input_responder`]) that auto-answers
+    /// secret prompts cannot tell a locally composed one — libssh asking for
+    /// the passphrase of a key file on THIS machine — from one the remote host
+    /// relayed over keyboard-interactive, where the server writes the prompt
+    /// text itself. Answering the second with the first's secret hands the
+    /// local key passphrase to the server. Prompt-text matching cannot close
+    /// that, because the text is precisely what an attacker controls; the
+    /// provenance has to be carried out of band, which is what this does.
+    ///
+    /// Callers pass [`AUTH_ORIGIN_LOCAL`] / [`AUTH_ORIGIN_SERVER`]. Terminal
+    /// overlay and headless UIs ignore the context, exactly as with
+    /// [`Self::input_with_context`].
+    pub fn password_with_context(&self, prompt: &str, context: &str) -> anyhow::Result<String> {
+        self.password_impl(prompt, Some(context.to_string()))
+    }
+
+    fn password_impl(&self, prompt: &str, context: Option<String>) -> anyhow::Result<String> {
         let mut promise = Promise::new();
         let future = promise.get_future().unwrap();
 
@@ -545,7 +591,7 @@ impl ConnectionUI {
             .send(UIRequest::Input {
                 prompt,
                 echo: false,
-                context: None,
+                context,
                 respond: promise,
             })
             .context("send to ConnectionUI failed")?;

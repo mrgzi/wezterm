@@ -8,11 +8,39 @@ pub struct AuthenticationPrompt {
     pub echo: bool,
 }
 
+/// Who composed an authentication prompt.
+///
+/// Termob fork. `SessionEvent::Authenticate` is emitted from several places
+/// that look identical to a consumer, but differ in a way that matters for
+/// secrets: some prompts are written by the CLIENT (libssh asking for the
+/// passphrase that decrypts a key file sitting on this machine), and some are
+/// relayed from the REMOTE HOST (keyboard-interactive, where the server
+/// chooses the prompt text outright).
+///
+/// Without this distinction an embedded responder cannot safely auto-answer a
+/// non-echo prompt: a hostile or compromised server can send
+/// `"Enter passphrase for key:"` over keyboard-interactive and be handed the
+/// local key passphrase — a secret that unlocks a LOCAL file and must never
+/// reach the wire. Matching on the prompt text cannot fix that, because the
+/// text is exactly what the attacker controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthPromptOrigin {
+    /// Composed on this machine (key passphrase, local pubkey callback).
+    /// A secret answered here never leaves the client.
+    Local,
+    /// Relayed from the remote host (keyboard-interactive, password auth).
+    /// Anything answered here is sent to the server.
+    Server,
+}
+
 #[derive(Debug)]
 pub struct AuthenticationEvent {
     pub username: String,
     pub instructions: String,
     pub prompts: Vec<AuthenticationPrompt>,
+    /// Termob fork: whether this prompt was composed locally or relayed from
+    /// the server. See [`AuthPromptOrigin`].
+    pub origin: AuthPromptOrigin,
     pub(crate) reply: Sender<Vec<String>>,
 }
 
@@ -63,9 +91,11 @@ impl crate::sessioninner::SessionInner {
         use std::path::{Path, PathBuf};
 
         if let Some(files) = self.config.get("identityfile") {
-            for file in files.split_whitespace() {
+            // Termob fork: `split_path_list` rather than `split_whitespace` so
+            // a path containing a space survives; see its doc comment.
+            for file in crate::config::split_path_list(files) {
                 let pubkey: PathBuf = format!("{}.pub", file).into();
-                let file = Path::new(file);
+                let file = Path::new(&file);
 
                 if !file.exists() {
                     continue;
@@ -100,6 +130,8 @@ impl crate::sessioninner::SessionInner {
                                     ),
                                     echo: false,
                                 }],
+                                // Termob fork: ssh2: passphrase decrypts a key file on THIS machine.
+                                origin: AuthPromptOrigin::Local,
                                 reply,
                             }))
                             .context("sending Authenticate request to user")?;
@@ -146,6 +178,8 @@ impl crate::sessioninner::SessionInner {
                     },
                     echo,
                 }],
+                // Termob fork: libssh pubkey callback: composed locally by libssh.
+                origin: AuthPromptOrigin::Local,
                 reply,
             }))
             .unwrap();
@@ -196,6 +230,8 @@ impl crate::sessioninner::SessionInner {
                                             echo: p.echo,
                                         })
                                         .collect(),
+                                    // Termob fork: libssh keyboard-interactive: prompt text is the SERVER's.
+                                    origin: AuthPromptOrigin::Server,
                                     reply,
                                 }))
                                 .context("sending Authenticate request to user")?;
@@ -228,6 +264,8 @@ impl crate::sessioninner::SessionInner {
                             prompt: "Password: ".to_string(),
                             echo: false,
                         }],
+                        // Termob fork: ssh2 password auth: answer is sent to the server.
+                        origin: AuthPromptOrigin::Server,
                         reply,
                     }))
                     .unwrap();
@@ -292,6 +330,8 @@ impl crate::sessioninner::SessionInner {
                             prompt: format!("Password for {}@{}: ", user, host),
                             echo: false,
                         }],
+                        // Termob fork: libssh password auth: answer is sent to the server.
+                        origin: AuthPromptOrigin::Server,
                         reply,
                     }))
                     .context("sending Authenticate request to user")?;
@@ -332,6 +372,8 @@ impl crate::sessioninner::SessionInner {
                                         echo: p.echo,
                                     })
                                     .collect(),
+                                // Termob fork: ssh2 keyboard-interactive: prompt text is the SERVER's.
+                                origin: AuthPromptOrigin::Server,
                                 reply,
                             },
                         )) {

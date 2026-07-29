@@ -24,7 +24,7 @@ use smol::{block_on, Async};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::marker::Unpin;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 #[cfg(unix)]
@@ -725,7 +725,7 @@ impl Reconnectable {
     }
 
     fn tls_creds_path(&self) -> anyhow::Result<PathBuf> {
-        let path = config::pki_dir()?.join(self.config.name());
+        let path = config::pki_dir()?.join(escape_for_directory_name(self.config.name()));
         std::fs::create_dir_all(&path)?;
         Ok(path)
     }
@@ -956,6 +956,36 @@ impl Reconnectable {
                             std::io::ErrorKind::ConnectionRefused => {
                                 // Server isn't up yet; let's proceed with bootstrap
                             }
+                            // Termob fork: NO CACHED CREDENTIALS — the whole
+                            // reason to bootstrap.
+                            //
+                            // This arm exists because of an interaction between
+                            // two pieces of code that each look correct alone.
+                            // Upstream, `try_connect` loaded the certificate with
+                            // `set_certificate_file`, which reports a missing file
+                            // as an `openssl::error::ErrorStack`. That does not
+                            // downcast to `io::Error`, so this whole `if let` was
+                            // skipped and control fell through to the bootstrap
+                            // block below — which is how a first-ever connection
+                            // was ever able to fetch its credentials.
+                            //
+                            // The fork later swapped those loads for
+                            // `std::fs::read` + `X509::from_pem` (the Android
+                            // `openssl no-stdio` fix: `BIO_new_file` does not
+                            // exist there, so the `*_file` helpers can never
+                            // succeed). That change was described as portability
+                            // only, and it is — for the OpenSSL calls. But it also
+                            // changed the ERROR TYPE to `io::Error`, and the guard
+                            // above branches on exactly that, so a missing cert
+                            // started matching the `_` arm and returning early.
+                            // Net effect: `bootstrap_via_ssh` could never run on a
+                            // device that had not already bootstrapped, i.e. it
+                            // only worked where it was not needed.
+                            //
+                            // `NotFound` means the local credential file is not
+                            // there; it says nothing about the remote host, so
+                            // bootstrapping is precisely the right next step.
+                            std::io::ErrorKind::NotFound => {}
                             _ => {
                                 // If it is an IO error that implies that we had an issue
                                 // reaching or otherwise talking to the remote host.
@@ -1037,10 +1067,32 @@ impl Reconnectable {
                     // Save the credentials to disk, as that is currently the easiest
                     // way to get them into openssl.  Ideally we'd keep these entirely
                     // in memory.
-                    std::fs::write(&self.tls_creds_ca_path()?, creds.ca_cert_pem.as_bytes())?;
-                    std::fs::write(
+                    // The CA is public information; the client credential is
+                    // NOT — `client_cert_pem` carries the private key in the
+                    // same file. Termob fork: this used to go through a plain
+                    // `std::fs::write`, which leaves the mode to the umask and
+                    // on a typical desktop produces a world-readable 0644 key.
+                    // The server writes the very same bytes owner-only (see
+                    // `wezterm-mux-server-impl::pki::write_atomic`), so this was
+                    // the one place where bootstrapping quietly downgraded the
+                    // secret it had just fetched — and it is now the default
+                    // path for termob's TLS picker.
+                    //
+                    // Both go through the same writer even though only one is
+                    // secret: the CA is read by the very same connect path, so
+                    // leaving it on a non-atomic `std::fs::write` would keep a
+                    // window where a concurrent connect reads a truncated
+                    // ca.pem and fails to parse it. Same failure, same fix —
+                    // only the permission bit differs.
+                    write_pem_atomic(
+                        &self.tls_creds_ca_path()?,
+                        creds.ca_cert_pem.as_bytes(),
+                        false,
+                    )?;
+                    write_pem_atomic(
                         &self.tls_creds_cert_path()?,
                         creds.client_cert_pem.as_bytes(),
+                        true,
                     )?;
                     log::info!("got TLS creds");
                     Ok(creds)
@@ -1176,7 +1228,7 @@ impl Reconnectable {
             .verify_hostname(!tls_client.accept_invalid_hostnames);
 
         ui.output_str(&format!("Connecting to {} using TLS\n", remote_address));
-        let stream = TcpStream::connect(remote_address)
+        let stream = tcp_connect_within(remote_address, tls_client.connect_timeout)
             .with_context(|| format!("connecting to {}", remote_address))?;
         stream.set_nodelay(true)?;
         stream.set_write_timeout(Some(tls_client.write_timeout))?;
@@ -1203,6 +1255,200 @@ impl Reconnectable {
     }
 }
 
+/// Turn a domain name into something usable as a single directory name on
+/// every platform we ship.
+///
+/// Termob fork. The bootstrapped credentials live in a directory named after
+/// the domain, and termob derives that name from the connection target — a TLS
+/// domain is `tls:<host>:<port>` — so that two servers cannot share one
+/// credential slot. On Windows `:` is not a legal filename character (and
+/// `name:stream` addresses an alternate data stream instead), so
+/// `create_dir_all` failed and TLS bootstrap could not work there at all.
+///
+/// The mapping is a percent-encoding rather than a "replace bad characters
+/// with `_`" pass, because the latter is not injective: `host:8443` and
+/// `host_8443` would collapse onto the same directory, and the whole reason
+/// the name carries the target is to keep two servers apart. `%` itself is
+/// escaped, so the encoding stays reversible and can never produce a
+/// collision. It is also fixed rather than hashed: a hash would move every
+/// stored credential whenever the hasher changed, forcing a silent
+/// re-bootstrap.
+///
+/// Applied on every platform, not behind `cfg(windows)`: one code path that
+/// the unix tests actually exercise beats a Windows-only branch that only
+/// breaks on the machine nobody is testing on.
+fn escape_for_directory_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        // Deliberately a small allowlist: anything outside it is escaped,
+        // which covers `:` `\` `/` `|` `<` `>` `"` `?` `*` and control
+        // characters without having to enumerate each platform's rules.
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            out.push(c);
+        } else {
+            for byte in c.to_string().as_bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    out
+}
+
+/// Write a bootstrapped PEM file, replacing any previous one atomically.
+///
+/// `owner_only` restricts the result to its owner on unix; pass it for
+/// anything carrying a private key.
+///
+/// Termob fork. Created because the bootstrap path stored a freshly fetched
+/// client credential — cert AND private key in one file — with `std::fs::write`,
+/// which leaves the mode to the umask and on a typical desktop produces a
+/// world-readable 0644 key.
+///
+/// The write goes through a sibling temporary file and a rename, so a reader
+/// only ever sees the whole old file or the whole new one. That matters here:
+/// termob supports several windows against one server, and two of them
+/// bootstrapping the same domain at the same moment would otherwise let one
+/// read a half-written credential and fail with a PEM parse error that says
+/// nothing about the real cause. The atomicity is not unix-specific, so it is
+/// NOT behind a `cfg` — only the permission bits are, since that is the one
+/// part with no Windows equivalent (there the file inherits the ACL of the
+/// per-user profile directory it is created in).
+///
+/// The temporary file is also what makes the permission guarantee hold on a
+/// rewrite: `mode` applies only when a file is CREATED, so writing in place
+/// over a credential left behind by an older build would silently keep its
+/// 0644.
+///
+/// The temporary name carries the process id, so two processes bootstrapping
+/// the same domain at once cannot collide on it. With a shared name one of
+/// them would unlink the other's file mid-write and its rename would then fail
+/// with a bare `No such file or directory` — a nondeterministic error pointing
+/// nowhere near the cause.
+fn write_pem_atomic(path: &Path, bytes: &[u8], owner_only: bool) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    // Same directory: `rename` is only atomic within one filesystem.
+    let mut tmp_path = path.as_os_str().to_os_string();
+    tmp_path.push(format!(".tmp.{}", std::process::id()));
+    let tmp_path = PathBuf::from(tmp_path);
+
+    // A leftover from an interrupted run of THIS pid (recycled after a crash)
+    // would fail `create_new` below, and on unix could carry an older mode.
+    match std::fs::remove_file(&tmp_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(anyhow::Error::new(err))
+                .with_context(|| format!("replacing {}", tmp_path.display()))
+        }
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if owner_only {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&tmp_path)
+        .with_context(|| format!("creating {}", tmp_path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", tmp_path.display()))?;
+    // Flush to disk before publishing the name: a crash between the two would
+    // otherwise leave a correctly named but empty credential.
+    file.sync_all()
+        .with_context(|| format!("syncing {}", tmp_path.display()))?;
+    drop(file);
+
+    // `fs::rename` replaces an existing destination on both unix and Windows
+    // (the latter via `MOVEFILE_REPLACE_EXISTING`).
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("renaming {} to {}", tmp_path.display(), path.display()))
+}
+
+/// How long a single address may take, given the time `left` in the overall
+/// budget and how many addresses (including this one) are still to be tried.
+///
+/// Split out from [`tcp_connect_within`] because the edges are what bite:
+/// dividing by zero, and handing `TcpStream::connect_timeout` a zero
+/// `Duration`, which it rejects outright — so an over-thin slice would turn
+/// "keep trying" into an instant hard failure. Both are pinned by tests; the
+/// surrounding connect loop is not reproducible without a firewall that drops
+/// SYNs.
+///
+/// `Duration` division takes a `u32`, so the address count is clamped into
+/// range; a resolver never returns anywhere near that many, and clamping keeps
+/// the conversion total instead of relying on a cast that could wrap.
+fn connect_budget_slice(left: Duration, remaining_addrs: usize) -> Duration {
+    let divisor = remaining_addrs.clamp(1, u32::MAX as usize) as u32;
+    (left / divisor).max(Duration::from_millis(1))
+}
+
+/// Connect to `remote_address` (`host:port`), giving up after `budget`.
+///
+/// Termob fork. `TcpStream::connect` carries no timeout: against a peer that
+/// silently drops SYNs — a firewall, a stale LAN address, a phone that has
+/// roamed off the network — it blocks for the OS retry budget (~75s on macOS,
+/// ~130s on Linux). That is indistinguishable from a hung app, and it is the
+/// most common connection failure on mobile.
+///
+/// A name can resolve to several addresses (typically one A and one AAAA).
+/// Each gets a slice of the remaining budget rather than a fresh copy of it,
+/// so the CONNECT phase is bounded by `budget` no matter how many addresses
+/// DNS returns; a blackholed AAAA can no longer consume the entire wait and
+/// leave a perfectly reachable A record untried. The last connect error is
+/// propagated — a refusal reports as a refusal, not as a timeout — and only a
+/// budget that expired before any address was tried reports as a timeout.
+///
+/// **Name resolution is NOT covered by the budget.** `to_socket_addrs` calls
+/// `getaddrinfo`, which has no portable timeout; bounding it means resolving on
+/// a throwaway thread and abandoning it, which leaks a thread per attempt. The
+/// resolver has its own (OS/libc-configured) timeout, so this is bounded, just
+/// not by us — an unreachable DNS server can still delay a connect beyond
+/// `budget`. Callers wanting a hard ceiling must impose it above this function.
+/// The common mobile failure this exists for — a reachable network with a
+/// silently dropped SYN — resolves promptly and is fully covered.
+fn tcp_connect_within(remote_address: &str, budget: Duration) -> anyhow::Result<TcpStream> {
+    let addrs: Vec<_> = remote_address
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {}", remote_address))?
+        .collect();
+    if addrs.is_empty() {
+        bail!("{} resolved to no addresses", remote_address);
+    }
+
+    let started = std::time::Instant::now();
+    let mut remaining_addrs = addrs.len();
+    let mut last_err = None;
+
+    for addr in addrs {
+        let left = budget.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        let slice = connect_budget_slice(left, remaining_addrs);
+        remaining_addrs = remaining_addrs.saturating_sub(1);
+        match TcpStream::connect_timeout(&addr, slice) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                log::debug!("connect to {addr} failed: {err:#}");
+                last_err = Some(err);
+            }
+        }
+    }
+
+    match last_err {
+        Some(err) => Err(anyhow::Error::new(err)),
+        // Every address was skipped because the budget ran out before its turn.
+        None => bail!(
+            "timed out after {:?} connecting to {}",
+            budget,
+            remote_address
+        ),
+    }
+}
+
 impl Client {
     fn new(local_domain_id: Option<DomainId>, mut reconnectable: Reconnectable) -> Self {
         let client_domain_config = reconnectable.config.clone();
@@ -1220,7 +1466,7 @@ impl Client {
             const MAX_INTERVAL: Duration = Duration::from_secs(10);
 
             let mut backoff = BASE_INTERVAL;
-            loop {
+            'client_thread: loop {
                 if let Err(e) = client_thread(&mut reconnectable, local_domain_id, &mut receiver) {
                     // Termob fork: the transport is down from here on. Flag it
                     // before any of the give-up branches below so a frontend
@@ -1268,6 +1514,32 @@ impl Client {
                             backoff,
                         )
                         .ok();
+
+                        // Termob fork: give up once nothing can use this
+                        // connection any more. Upstream's retry loop had no
+                        // exit other than a successful reconnect, so detaching
+                        // a domain (or closing its last pane) left this OS
+                        // thread reconnecting to a server nobody was listening
+                        // to, forever, at up to one TLS handshake every
+                        // MAX_INTERVAL. On mobile that is a background battery
+                        // and data drain that outlives the UI that started it.
+                        //
+                        // The channel is the precise signal: `sender` lives in
+                        // `Client`, which lives in the `ClientInner` that
+                        // `ClientDomain::perform_detach` drops, so the channel
+                        // closes exactly when the last holder is gone. A
+                        // network drop does NOT close it — the domain keeps
+                        // `inner` across disconnects, which is what makes the
+                        // roaming reconnect above work — so this cannot cut a
+                        // reconnect that someone is still waiting on.
+                        if receiver.is_closed() {
+                            log::info!(
+                                "nothing is using this connection any more; \
+                                 abandoning reconnect attempts"
+                            );
+                            break 'client_thread;
+                        }
+
                         let initial = false;
                         let no_auto_start = true; // Don't auto-start on a reconnect
                         match reconnectable.connect(initial, &mut ui, no_auto_start) {
@@ -1593,4 +1865,198 @@ impl Client {
         GetPaneDirectionResponse
     );
     rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
+}
+
+/// Termob fork tests: the bounded TCP connect added alongside
+/// `TlsDomainClient::connect_timeout`, plus the on-disk handling of
+/// bootstrapped TLS credentials (directory naming and atomic writes).
+#[cfg(test)]
+mod termob_fork_tests {
+    use super::{connect_budget_slice, escape_for_directory_name, tcp_connect_within};
+    use std::time::Duration;
+
+    /// The canonical TLS domain name carries the target, so it always contains
+    /// colons — which Windows rejects outright as a filename character. Before
+    /// this, `create_dir_all` failed there and TLS bootstrap was impossible.
+    #[test]
+    fn domain_name_becomes_a_legal_directory_name() {
+        let escaped = escape_for_directory_name("tls:10.0.0.5:8080");
+        assert_eq!(escaped, "tls%3A10.0.0.5%3A8080");
+        for illegal in ['<', '>', ':', '"', '/', '\\', '|', '?', '*'] {
+            // Edition 2018: inline captures are NOT interpolated in an
+            // `assert!` message, so the values are passed as arguments.
+            assert!(
+                !escaped.contains(illegal),
+                "{:?} is not legal in a Windows filename: {}",
+                illegal,
+                escaped
+            );
+        }
+    }
+
+    /// Escaping must stay injective: the whole point of putting the target in
+    /// the name is that two servers get separate credential directories. A
+    /// "replace bad characters with `_`" pass would collapse these two.
+    #[test]
+    fn different_targets_never_share_a_directory() {
+        assert_ne!(
+            escape_for_directory_name("tls:host:8443"),
+            escape_for_directory_name("tls:host_8443")
+        );
+        // The escape character itself has to be escaped, or a name containing
+        // a literal `%3A` would collide with one containing a real colon.
+        assert_ne!(
+            escape_for_directory_name("tls:a"),
+            escape_for_directory_name("tls%3Aa")
+        );
+    }
+
+    /// Ordinary characters are left alone, so an already-safe name keeps a
+    /// readable directory that a user can find by eye.
+    #[test]
+    fn safe_names_are_unchanged() {
+        assert_eq!(escape_for_directory_name("termob-tls"), "termob-tls");
+        assert_eq!(
+            escape_for_directory_name("host.example_1"),
+            "host.example_1"
+        );
+    }
+
+    /// The credential is written whole or not at all, and when asked for
+    /// owner-only it stays 0600 — including when it REPLACES an existing file,
+    /// which is where an in-place write would have kept the old mode.
+    #[test]
+    fn private_pem_is_replaced_atomically_and_stays_owner_only() {
+        let dir = std::env::temp_dir().join(format!("termob-pem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("cert.pem");
+
+        // Pre-existing, deliberately world-readable, with different content.
+        std::fs::write(&path, b"stale").expect("seed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        }
+
+        super::write_pem_atomic(&path, b"fresh", true).expect("write");
+        assert_eq!(std::fs::read(&path).expect("read"), b"fresh");
+        assert!(
+            !dir.join(format!("cert.pem.tmp.{}", std::process::id()))
+                .exists(),
+            "temporary file must not be left behind"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "key must not be readable by others");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The CA goes through the same writer with `owner_only = false`: it is
+    /// public information, and forcing 0600 on it would be a gratuitous
+    /// difference from what the server writes.
+    #[test]
+    fn public_pem_is_not_restricted() {
+        let dir = std::env::temp_dir().join(format!("termob-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("ca.pem");
+
+        super::write_pem_atomic(&path, b"ca", false).expect("write");
+        assert_eq!(std::fs::read(&path).expect("read"), b"ca");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_ne!(mode & 0o777, 0o600, "the CA is not a secret");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A single address gets the whole remaining budget, and two addresses
+    /// split it — so the total wait stays bounded by the budget no matter how
+    /// many records DNS returns. Without the split, a blackholed AAAA would
+    /// burn the entire budget and leave a reachable A record untried.
+    #[test]
+    fn budget_is_shared_between_addresses() {
+        assert_eq!(
+            connect_budget_slice(Duration::from_secs(10), 1),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            connect_budget_slice(Duration::from_secs(10), 2),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            connect_budget_slice(Duration::from_secs(9), 3),
+            Duration::from_secs(3)
+        );
+    }
+
+    /// `TcpStream::connect_timeout` REJECTS a zero duration, so a slice that
+    /// rounds down to nothing would turn "almost out of time" into an instant
+    /// hard failure rather than one last attempt. It must never be zero.
+    #[test]
+    fn slice_is_never_zero() {
+        assert!(!connect_budget_slice(Duration::from_nanos(1), 64).is_zero());
+        assert!(!connect_budget_slice(Duration::ZERO, 1).is_zero());
+    }
+
+    /// Zero addresses must not divide by zero. The connect loop cannot reach
+    /// this (it iterates exactly `addrs.len()` times), but the guard is the
+    /// reason it cannot, so it is pinned rather than assumed.
+    #[test]
+    fn zero_remaining_addresses_does_not_panic() {
+        assert!(!connect_budget_slice(Duration::from_secs(1), 0).is_zero());
+    }
+
+    /// A reachable listener connects, and the budget does not interfere.
+    #[test]
+    fn connects_to_a_live_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tcp_connect_within(&addr.to_string(), Duration::from_secs(5)).expect("should connect");
+    }
+
+    /// A refused port reports the OS error, NOT a synthesised timeout — the
+    /// distinction is what tells a user "nothing is listening there" apart
+    /// from "I could not reach that host at all".
+    #[test]
+    fn refused_port_reports_the_os_error() {
+        // Bind then drop: the port was just in use, so nothing is listening.
+        let addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("local_addr")
+        };
+        let err = tcp_connect_within(&addr.to_string(), Duration::from_secs(5))
+            .expect_err("nothing is listening");
+        assert!(
+            err.downcast_ref::<std::io::Error>().is_some(),
+            "expected the underlying io::Error, got: {:#}",
+            err
+        );
+        assert!(
+            !format!("{err:#}").contains("timed out"),
+            "a refusal must not be reported as a timeout: {:#}",
+            err
+        );
+    }
+
+    /// A name that resolves to nothing fails with a clear message instead of
+    /// silently succeeding at "tried every address".
+    #[test]
+    fn unresolvable_name_is_an_error() {
+        let err = tcp_connect_within("no-such-host.invalid:8443", Duration::from_secs(2))
+            .expect_err("`.invalid` is reserved and must not resolve");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no-such-host.invalid"),
+            "unhelpful error: {}",
+            msg
+        );
+    }
 }
