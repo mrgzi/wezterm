@@ -296,7 +296,11 @@ mod ssh2_impl {
             }
 
             match opts.write {
-                Some(WriteMode::Write) => flags |= Self::WRITE | Self::TRUNCATE,
+                // CREATE for parity with the libssh backend and with the
+                // `Sftp::create` docs ("create a file ... with truncation");
+                // without it, writing a non-existent path failed with
+                // SSH_FX_NO_SUCH_FILE instead of creating the file.
+                Some(WriteMode::Write) => flags |= Self::WRITE | Self::TRUNCATE | Self::CREATE,
                 Some(WriteMode::Append) => flags |= Self::WRITE | Self::APPEND | Self::CREATE,
                 None => {}
             }
