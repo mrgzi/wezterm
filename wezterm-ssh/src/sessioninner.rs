@@ -22,6 +22,20 @@ use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
 use std::time::{Duration, Instant};
 
+/// Termob fork: shortest wait in the session poll loop, and the value the
+/// backoff resets to after any activity.
+const MIN_POLL_DELAY: Duration = Duration::from_millis(100);
+
+/// Termob fork: upper bound for the poll backoff.
+///
+/// The wait is a *fallback*: bytes already buffered inside the ssh library no
+/// longer make the socket readable, so nothing wakes the loop for them and
+/// they are only picked up when the poll times out. An unbounded backoff
+/// therefore turns into unbounded latency for that case; the cap keeps the
+/// worst case at a quarter second while an idle session still avoids
+/// busy-polling.
+const MAX_POLL_DELAY: Duration = Duration::from_millis(250);
+
 #[derive(Debug)]
 pub(crate) struct DescriptorState {
     pub fd: Option<FileDescriptor>,
@@ -478,11 +492,19 @@ impl SessionInner {
     }
 
     fn request_loop(&mut self, sess: &mut SessionWrap) -> anyhow::Result<()> {
-        let mut sleep_delay = Duration::from_millis(100);
+        let mut sleep_delay = MIN_POLL_DELAY;
 
         loop {
             self.do_keepalive(sess)?;
-            self.tick_io()?;
+            // Termob fork: `tick_io` reports whether it actually moved bytes.
+            // A single tick performs at most one read per channel, so when it
+            // did move data the ssh library may still be holding more in its
+            // own buffer -- and buffered bytes make the socket look quiet, so
+            // `poll` would not report them. Polling with a zero timeout in
+            // that case drains the backlog at full speed instead of one
+            // chunk per timeout, which is what made heavy output arrive in
+            // visible stutters.
+            let moved_io = self.tick_io()?;
             self.drain_request_pipe();
             self.dispatch_pending_requests(sess)?;
             self.connect_pending_agent_forward_channels(sess);
@@ -494,6 +516,27 @@ impl SessionInner {
                 return Ok(());
             }
 
+            // Termob fork: also watch the session socket for readability
+            // whenever a channel has room for more output.
+            //
+            // `get_poll_flags` only reports what the ssh library is currently
+            // *blocked* on; once a call completes it goes back to zero, and a
+            // zero event mask means `poll` ignores the socket entirely. Remote
+            // output arriving after that point was therefore not noticed until
+            // the poll timed out -- one full timeout of latency on every
+            // keystroke echo. Asking for POLLIN as well makes the loop
+            // event-driven again.
+            //
+            // The "has room" condition matters: when every output buffer is
+            // full we deliberately do not consume the socket, and an
+            // unconditional POLLIN would then spin at 100% CPU on a socket we
+            // refuse to read. In that state the pipe descriptors are already
+            // polled for POLLOUT, so the loop still wakes as soon as the
+            // consumer drains them.
+            let mut session_events = sess.get_poll_flags();
+            if self.has_room_for_channel_output() {
+                session_events |= POLLIN;
+            }
             let mut poll_array = vec![
                 pollfd {
                     fd: self.sender_read.as_socket_descriptor(),
@@ -502,7 +545,7 @@ impl SessionInner {
                 },
                 pollfd {
                     fd: sess.as_socket_descriptor(),
-                    events: sess.get_poll_flags(),
+                    events: session_events,
                     revents: 0,
                 },
             ];
@@ -527,12 +570,25 @@ impl SessionInner {
                 }
             }
 
-            poll(&mut poll_array, Some(sleep_delay)).context("poll")?;
-            sleep_delay += sleep_delay;
+            // Termob fork: bounded backoff. Upstream doubled `sleep_delay`
+            // forever (100ms, 200ms, ... minutes), and it is only reset when
+            // some descriptor reports activity -- but data buffered inside the
+            // ssh library never shows up as descriptor activity, so on a quiet
+            // link the loop could sit on a multi-second timeout while output
+            // was already available. The backoff still exists (an idle session
+            // must not busy-poll) but it can no longer grow past
+            // `MAX_POLL_DELAY`.
+            let wait = if moved_io { Duration::ZERO } else { sleep_delay };
+            poll(&mut poll_array, Some(wait)).context("poll")?;
+            sleep_delay = if moved_io {
+                MIN_POLL_DELAY
+            } else {
+                (sleep_delay + sleep_delay).min(MAX_POLL_DELAY)
+            };
 
             for (idx, poll) in poll_array.iter().enumerate() {
                 if poll.revents != 0 {
-                    sleep_delay = Duration::from_millis(100);
+                    sleep_delay = MIN_POLL_DELAY;
                 }
                 if idx == 0 || idx == 1 {
                     // Dealt with at the top of the loop
@@ -584,7 +640,17 @@ impl SessionInner {
 
     /// Goal: if we have data to write to channels, try to send it.
     /// If we have room in our channel fd write buffers, try to fill it
-    fn tick_io(&mut self) -> anyhow::Result<()> {
+    ///
+    /// Termob fork: returns `true` when this tick actually moved bytes in
+    /// either direction.
+    ///
+    /// Each tick performs at most one read per channel stream, so a `true`
+    /// result means there may be more waiting inside the ssh library. Since
+    /// buffered bytes do not make the socket readable, the caller polls with
+    /// a zero timeout in that case and ticks again immediately, draining the
+    /// backlog without waiting for a timeout that nothing will shorten.
+    fn tick_io(&mut self) -> anyhow::Result<bool> {
+        let mut moved = false;
         let mut dead = vec![];
         for (id, chan) in self.channels.iter_mut() {
             if chan.exit.is_some() {
@@ -598,6 +664,7 @@ impl SessionInner {
 
             let stdin = &mut chan.descriptors[0];
             if stdin.fd.is_some() && !stdin.buf.is_empty() {
+                let before = stdin.buf.len();
                 if let Err(err) = write_from_buf(&mut chan.channel.writer(), &mut stdin.buf)
                     .context("writing to channel")
                 {
@@ -608,6 +675,7 @@ impl SessionInner {
                     );
                     stdin.fd.take();
                 }
+                moved |= stdin.buf.len() != before;
             }
 
             for (idx, out) in chan
@@ -626,7 +694,9 @@ impl SessionInner {
                     continue;
                 }
                 match read_into_buf(&mut chan.channel.reader(idx), &mut out.buf) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        moved |= out.buf.len() != current_len;
+                    }
                     Err(err) => {
                         if out.buf.is_empty() {
                             log::trace!(
@@ -661,7 +731,23 @@ impl SessionInner {
         for id in dead {
             self.channels.remove(&id);
         }
-        Ok(())
+        Ok(moved)
+    }
+
+    /// Termob fork: does any channel still have room for more remote output?
+    ///
+    /// Used to decide whether the session socket is worth polling for
+    /// readability. When every output buffer is full the loop deliberately
+    /// stops consuming the socket, and asking for POLLIN there would spin on
+    /// a socket we refuse to drain; the per-descriptor POLLOUT wakeups still
+    /// cover that state.
+    fn has_room_for_channel_output(&self) -> bool {
+        self.channels.values().any(|info| {
+            info.descriptors
+                .iter()
+                .skip(1)
+                .any(|state| state.fd.is_some() && state.buf.len() < state.buf.capacity())
+        })
     }
 
     fn drain_request_pipe(&mut self) {
