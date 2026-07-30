@@ -273,6 +273,16 @@ impl RemoteSshDomain {
         ssh_domain_to_ssh_config(&self.dom)
     }
 
+    /// Returns a clone of the underlying SSH session handle, if the session
+    /// has been established. The session is created lazily by the first
+    /// `spawn_pane` (interactive auth happens inside that pane), so this
+    /// returns `None` until a pane has been spawned. Embedders can use the
+    /// handle to run auxiliary operations (eg: provisioning files over sftp)
+    /// on the same authenticated connection.
+    pub fn connected_session(&self) -> Option<Session> {
+        self.session.lock().unwrap().clone()
+    }
+
     fn build_command(
         &self,
         pane_id: PaneId,
