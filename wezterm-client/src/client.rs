@@ -1010,19 +1010,8 @@ impl Reconnectable {
                 let mut ssh_config = wezterm_ssh::Config::new();
                 ssh_config.add_default_config_files();
 
-                let mut fields = ssh_params.host_and_port.split(':');
-                let host = fields
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("no host component somehow"))?;
-                let port = fields.next();
-
-                let mut ssh_config = ssh_config.for_host(host);
-                if let Some(username) = &ssh_params.username {
-                    ssh_config.insert("user".to_string(), username.to_string());
-                }
-                if let Some(port) = port {
-                    ssh_config.insert("port".to_string(), port.to_string());
-                }
+                let ssh_config =
+                    bootstrap_ssh_config(&ssh_config, &ssh_params, &tls_client.ssh_option)?;
 
                 let sess = ssh_connect_with_ui(ssh_config, ui)?;
 
@@ -1292,6 +1281,42 @@ fn escape_for_directory_name(name: &str) -> String {
         }
     }
     out
+}
+
+/// Build the `ConfigMap` for the one-shot bootstrap ssh session.
+///
+/// Termob fork. The layering mirrors `mux::ssh::ssh_domain_to_ssh_config`:
+/// per-host defaults from `for_host`, then the caller's `ssh_option`, then
+/// the `user`/`port` parsed out of `bootstrap_via_ssh`. The bootstrap target
+/// is the more specific statement of intent, so it stays last and wins over a
+/// `user`/`port` that happened to arrive through `ssh_option`.
+///
+/// Extracted from `tls_connect` rather than left inline so that the ordering
+/// above is testable: with an empty `ssh_option` the result has to match what
+/// `tls_connect` produced before this option existed, and that is the property
+/// most likely to be broken by a later edit.
+fn bootstrap_ssh_config(
+    ssh_config: &wezterm_ssh::Config,
+    ssh_params: &config::SshParameters,
+    ssh_option: &HashMap<String, String>,
+) -> anyhow::Result<wezterm_ssh::ConfigMap> {
+    let mut fields = ssh_params.host_and_port.split(':');
+    let host = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no host component somehow"))?;
+    let port = fields.next();
+
+    let mut ssh_config = ssh_config.for_host(host);
+    for (k, v) in ssh_option {
+        ssh_config.insert(k.to_string(), v.to_string());
+    }
+    if let Some(username) = &ssh_params.username {
+        ssh_config.insert("user".to_string(), username.to_string());
+    }
+    if let Some(port) = port {
+        ssh_config.insert("port".to_string(), port.to_string());
+    }
+    Ok(ssh_config)
 }
 
 /// Write a bootstrapped PEM file, replacing any previous one atomically.
@@ -1872,8 +1897,127 @@ impl Client {
 /// bootstrapped TLS credentials (directory naming and atomic writes).
 #[cfg(test)]
 mod termob_fork_tests {
-    use super::{connect_budget_slice, escape_for_directory_name, tcp_connect_within};
+    use super::{
+        bootstrap_ssh_config, connect_budget_slice, escape_for_directory_name, tcp_connect_within,
+    };
+    use std::collections::HashMap;
     use std::time::Duration;
+
+    /// A `Config` that resolves `$HOME` (and every other env lookup) from a
+    /// fixed map instead of the machine running the test, and that parses no
+    /// `ssh_config` files. Without this the expectations below would depend on
+    /// whoever's home directory the test happens to run in.
+    fn hermetic_config() -> wezterm_ssh::Config {
+        let mut env = wezterm_ssh::ConfigMap::new();
+        env.insert("HOME".to_string(), "/home/tester".to_string());
+        let mut config = wezterm_ssh::Config::new();
+        config.assign_environment(env);
+        config
+    }
+
+    fn params(user: Option<&str>, host_and_port: &str) -> config::SshParameters {
+        config::SshParameters {
+            username: user.map(str::to_string),
+            host_and_port: host_and_port.to_string(),
+        }
+    }
+
+    /// The guard for the whole `ssh_option` addition: with the option empty —
+    /// which is every configuration that existed before it — the bootstrap
+    /// session must be configured exactly as it was when the code was inline.
+    /// `identityfile` here is the `$HOME` default, i.e. nothing the caller
+    /// injected.
+    #[test]
+    fn empty_ssh_option_leaves_the_bootstrap_config_unchanged() {
+        let config = hermetic_config();
+        let built = bootstrap_ssh_config(
+            &config,
+            &params(Some("alice"), "example.com:2222"),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let mut expected = config.for_host("example.com");
+        expected.insert("user".to_string(), "alice".to_string());
+        expected.insert("port".to_string(), "2222".to_string());
+
+        assert_eq!(built, expected);
+        assert_eq!(
+            built.get("identityfile").map(String::as_str),
+            Some(
+                "/home/tester/.ssh/id_dsa /home/tester/.ssh/id_ecdsa \
+                 /home/tester/.ssh/id_ed25519 /home/tester/.ssh/id_rsa"
+            )
+        );
+    }
+
+    /// The reason the option exists: on a phone there is no `~/.ssh` and no
+    /// agent, so the identity can only come from the caller. It has to replace
+    /// the `$HOME` default rather than be appended after it — an unreadable
+    /// default path ahead of it is what libssh would try first.
+    #[test]
+    fn caller_identity_file_overrides_the_home_default() {
+        let mut ssh_option = HashMap::new();
+        ssh_option.insert(
+            "identityfile".to_string(),
+            "/data/app/keys/id_ed25519".to_string(),
+        );
+        ssh_option.insert("identitiesonly".to_string(), "yes".to_string());
+
+        let built = bootstrap_ssh_config(
+            &hermetic_config(),
+            &params(Some("alice"), "example.com"),
+            &ssh_option,
+        )
+        .unwrap();
+
+        assert_eq!(
+            built.get("identityfile").map(String::as_str),
+            Some("/data/app/keys/id_ed25519")
+        );
+        assert_eq!(built.get("identitiesonly").map(String::as_str), Some("yes"));
+    }
+
+    /// Ordering, mirroring `mux::ssh::ssh_domain_to_ssh_config`: whatever the
+    /// caller passed, the target the user actually typed into
+    /// `bootstrap_via_ssh` decides who we log in as and on which port.
+    /// Otherwise a stale `user` left in `ssh_option` would silently redirect
+    /// the login.
+    #[test]
+    fn bootstrap_target_user_and_port_win_over_ssh_option() {
+        let mut ssh_option = HashMap::new();
+        ssh_option.insert("user".to_string(), "someone-else".to_string());
+        ssh_option.insert("port".to_string(), "9999".to_string());
+
+        let built = bootstrap_ssh_config(
+            &hermetic_config(),
+            &params(Some("alice"), "example.com:2222"),
+            &ssh_option,
+        )
+        .unwrap();
+
+        assert_eq!(built.get("user").map(String::as_str), Some("alice"));
+        assert_eq!(built.get("port").map(String::as_str), Some("2222"));
+    }
+
+    /// A target without a user is valid (`host` alone); the local user default
+    /// from `for_host` must survive, and `ssh_option` must still be able to set
+    /// it — this is the one case where the caller's `user` is not overridden.
+    #[test]
+    fn ssh_option_user_applies_when_the_target_has_none() {
+        let mut ssh_option = HashMap::new();
+        ssh_option.insert("user".to_string(), "someone-else".to_string());
+
+        let built = bootstrap_ssh_config(
+            &hermetic_config(),
+            &params(None, "example.com"),
+            &ssh_option,
+        )
+        .unwrap();
+
+        assert_eq!(built.get("user").map(String::as_str), Some("someone-else"));
+        assert_eq!(built.get("port").map(String::as_str), Some("22"));
+    }
 
     /// The canonical TLS domain name carries the target, so it always contains
     /// colons — which Windows rejects outright as a filename character. Before

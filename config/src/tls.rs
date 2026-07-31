@@ -38,6 +38,24 @@ pub struct TlsDomainClient {
     /// The value is "user@host:port", just like "wezterm ssh" accepts.
     pub bootstrap_via_ssh: Option<String>,
 
+    /// ssh_config option values for the one-shot bootstrap ssh session,
+    /// mirroring `SshDomain::ssh_option`.
+    ///
+    /// Without this there is no way to tell the bootstrap session which
+    /// identity to use: it is built from `Config::new()` +
+    /// `add_default_config_files()`, so it can only ever see `~/.ssh/config`
+    /// and the default `~/.ssh/id_*` search. On a platform where neither
+    /// exists -- an Android or iOS app sandbox, where `$HOME` is the app's
+    /// own data directory and there is no ssh-agent -- the bootstrap can
+    /// therefore never authenticate, which makes `bootstrap_via_ssh`
+    /// unusable in exactly the place it is most useful.
+    ///
+    /// The values are caller-trusted, the same contract as
+    /// `SshDomain::ssh_option`. Leaving this empty (the default) reproduces
+    /// the previous behaviour byte for byte.
+    #[dynamic(default)]
+    pub ssh_option: HashMap<String, String>,
+
     /// identifies the host:port pair of the remote server.
     pub remote_address: String,
 
