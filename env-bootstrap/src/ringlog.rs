@@ -238,7 +238,19 @@ pub fn get_entries() -> Vec<Entry> {
     entries
 }
 
-fn prune_old_logs() {
+/// Delete `*-log-*.txt` files in the runtime directory that have not been
+/// written to for a week.
+///
+/// Termob fork: this used to be private and `setup_pretty` only called it for
+/// executables whose name contains "gui". Every other long-lived process --
+/// including a mux daemon -- therefore left one log file per run behind
+/// forever (measured: 1739 `termob-server-log-<pid>.txt` files accumulated in
+/// 11 days of development). The "gui" test is a proxy for "this process is
+/// long-lived enough to absorb a `read_dir`", and it cannot answer that for an
+/// embedder, so the decision belongs to the caller: exposed here so a daemon
+/// can prune once at startup, while short-lived `cli` subcommands keep the
+/// low-startup-overhead behaviour that motivated the original gate.
+pub fn prune_old_logs() {
     let one_week = std::time::Duration::from_secs(86400 * 7);
     if let Ok(dir) = std::fs::read_dir(&*config::RUNTIME_DIR) {
         for entry in dir {

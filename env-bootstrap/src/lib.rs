@@ -1,5 +1,5 @@
 pub mod ringlog;
-pub use ringlog::setup_logger;
+pub use ringlog::{prune_old_logs, setup_logger};
 use std::path::{Path, PathBuf};
 
 pub fn set_wezterm_executable() {

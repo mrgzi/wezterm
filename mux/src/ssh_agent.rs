@@ -79,9 +79,69 @@ fn update_symlink<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> anyho
     }
 }
 
+/// Is the process that owns an `agent.PID` symlink still running?
+///
+/// `kill(pid, 0)` succeeds for a live process we may signal and fails with
+/// `EPERM` for a live process owned by somebody else; only `ESRCH` (and any
+/// other error) means "gone". Answering "alive" when unsure is the safe
+/// direction: it keeps a symlink that may still be in use, and the worst case
+/// is that one file survives until the next start.
+#[cfg(unix)]
+fn agent_owner_is_alive(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Windows has no equally cheap liveness probe, so never prune there.
+#[cfg(windows)]
+fn agent_owner_is_alive(_pid: i32) -> bool {
+    true
+}
+
+/// Remove `agent.PID` symlinks whose owning process is gone.
+///
+/// Termob fork: `AgentProxy::drop` removes our own symlink, but a mux that
+/// exits on a signal (`SIGTERM` from a service manager or a container stop) or
+/// through `std::process::exit` never runs `Drop`, so the runtime directory
+/// gained one dangling symlink per run and never lost one (measured: 6995
+/// `agent.*` entries, 200 out of 200 sampled pointing at dead pids).
+///
+/// Keyed on process liveness rather than age, because that is the actual
+/// invariant: a dead pid's symlink can never become useful again, while a
+/// young one may belong to a mux that started seconds ago.
+fn prune_dead_agent_symlinks() {
+    let Ok(dir) = std::fs::read_dir(&*config::RUNTIME_DIR) else {
+        return;
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        // `pid > 0` is required, not cosmetic: `kill` reads 0 as "my whole
+        // process group" and -1 as "every process I may signal", so a
+        // hand-made `agent.0` or `agent.-1` would turn the probe into a
+        // question about something else entirely. We only ever create
+        // `agent.<getpid()>`, so anything outside that shape is not ours to
+        // reason about.
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("agent."))
+            .and_then(|pid| pid.parse::<i32>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        if !agent_owner_is_alive(pid) {
+            std::fs::remove_file(entry.path()).ok();
+        }
+    }
+}
+
 impl AgentProxy {
     pub fn new() -> Self {
         let pid = unsafe { libc::getpid() };
+        // Before adding ours, clear out the ones their owners could not.
+        prune_dead_agent_symlinks();
         let sock_path = config::RUNTIME_DIR.join(format!("agent.{pid}"));
 
         if let Some(inherited) = Self::default_ssh_auth_sock() {
@@ -214,5 +274,48 @@ impl AgentProxy {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::agent_owner_is_alive;
+
+    /// The liveness probe must not be inverted: reporting a live process as
+    /// dead would make `prune_dead_agent_symlinks` delete the symlink that a
+    /// running mux is actively serving. Our own pid is the one case that can be
+    /// asserted with certainty.
+    #[test]
+    fn own_process_is_alive() {
+        let me = std::process::id() as i32;
+        assert!(agent_owner_is_alive(me), "our own pid must read as alive");
+    }
+
+    /// A live process we may not signal must still read as alive: `kill` fails
+    /// with `EPERM` there, and treating that as "gone" would prune another
+    /// user's symlink. pid 1 always exists and is root-owned, so this covers
+    /// the `EPERM` branch unless the tests run as root -- in which case the
+    /// `Ok` branch is taken and the assertion still holds.
+    #[test]
+    fn process_owned_by_another_user_is_alive() {
+        assert!(
+            agent_owner_is_alive(1),
+            "pid 1 exists; EPERM must not be read as gone"
+        );
+    }
+
+    /// A reaped child is definitively gone (waited on, so no zombie keeps the
+    /// pid occupied) and its symlink is safe to prune.
+    #[test]
+    fn reaped_child_is_not_alive() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id() as i32;
+        child.wait().expect("reap child");
+        assert!(
+            !agent_owner_is_alive(pid),
+            "a reaped child's pid must read as gone"
+        );
     }
 }
