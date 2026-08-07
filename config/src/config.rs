@@ -1798,8 +1798,18 @@ pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
 /// Windows `runtime_dir()` is `None`, so this is byte-for-byte the path the
 /// PKI already used and no credential migration is needed. Only Linux moves,
 /// and only off a directory that did not survive a reboot anyway.
+/// Termob fork: the PKI lives under the embedding product's own directory.
+///
+/// These paths are not internal. A user establishing trust to a server types
+/// them into the connection form and reads them back in the certificate the
+/// client presents, so a path naming a different product is a name they have
+/// to explain to themselves before they can trust it.
+///
+/// Only the PKI moves. The multiplexer socket keeps its upstream location,
+/// because that path is part of the protocol surface an existing client may
+/// already be pointed at.
 pub fn pki_dir() -> anyhow::Result<PathBuf> {
-    Ok(crate::HOME_DIR.join(".local/share/wezterm/pki"))
+    Ok(crate::HOME_DIR.join(".local/share/termob/pki"))
 }
 
 pub fn default_read_timeout() -> Duration {

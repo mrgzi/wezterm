@@ -889,6 +889,44 @@ impl Mux {
         Self::effective_size_for(authority.get(&pane_id), per_pane).unwrap_or(size)
     }
 
+    /// Termob fork (min-grid): drop `client_id`'s recorded size for ONE pane
+    /// and re-apply the new minimum, for a client that is still connected but
+    /// has stopped presenting that pane.
+    ///
+    /// [`Mux::forget_client_pane_sizes`] handles a client going away, which is
+    /// the whole connection at once. This is the narrower case: a client
+    /// removes a single pane from its own view and keeps the others. Without
+    /// it, the departed report stays in the minimum and the pane is held at the
+    /// size of a window nobody is looking at — the smallest-client model
+    /// applied to a client that is no longer a viewer.
+    pub fn forget_client_pane_size(&self, client_id: &ClientId, pane_id: PaneId) {
+        let changed = {
+            let mut sizes = self.client_pane_sizes.write();
+            let authority = self.pane_size_authority.read();
+            let Some(per_pane) = sizes.get_mut(&pane_id) else {
+                return;
+            };
+            let owner = authority.get(&pane_id);
+            let old = Self::effective_size_for(owner, per_pane);
+            if per_pane.remove(client_id).is_none() {
+                return;
+            }
+            let new = Self::effective_size_for(owner, per_pane);
+            if per_pane.is_empty() {
+                sizes.remove(&pane_id);
+            }
+            match new {
+                // The last reporter left: keep the pane where it is rather than
+                // resizing it to nothing. A later report re-establishes the
+                // minimum.
+                None => return,
+                Some(new) if Some(new) == old => return,
+                Some(new) => vec![(pane_id, new)],
+            }
+        };
+        Self::reapply_pane_sizes(changed);
+    }
+
     /// Termob fork (min-grid): drop `client_id`'s recorded sizes and
     /// re-apply the new minimum to any pane whose effective size changed —
     /// when the smallest client disconnects, the survivors' panes grow back
