@@ -1212,6 +1212,93 @@ impl Mux {
         })
     }
 
+    /// termob fork addition: spawn a new pane and group it under the SAME tab
+    /// as `anchor_pane_id`, WITHOUT mux split-size accounting (no area guard,
+    /// no pane resize). Parallels [`Self::split_pane`] but routes through
+    /// [`Tab::add_pane_no_split`] instead of `Domain::split_pane`.
+    ///
+    /// termob owns the visual layout (egui_tiles) and sizes panes itself, so
+    /// the upstream split path's "halve the anchor on every split → No space
+    /// after a few panes" limit is a cosmetic mux artifact termob must avoid.
+    /// All panes stay under one mux tab (so `resolve_pane_id` reports one
+    /// tab_id), which keeps termob's per-tab state organized.
+    pub async fn add_pane_to_tab(
+        &self,
+        anchor_pane_id: PaneId,
+        source: SplitSource,
+        domain: config::keyassignment::SpawnTabDomain,
+    ) -> anyhow::Result<(Arc<dyn Pane>, TerminalSize)> {
+        let (_pane_domain_id, window_id, tab_id) = self
+            .resolve_pane_id(anchor_pane_id)
+            .ok_or_else(|| anyhow!("pane_id {} invalid", anchor_pane_id))?;
+
+        let domain = self
+            .resolve_spawn_tab_domain(Some(anchor_pane_id), &domain)
+            .context("resolve_spawn_tab_domain")?;
+
+        if domain.state() == DomainState::Detached {
+            domain.attach(Some(window_id)).await?;
+        }
+
+        let anchor_pane = self
+            .get_pane(anchor_pane_id)
+            .ok_or_else(|| anyhow!("pane_id {} is invalid", anchor_pane_id))?;
+        let term_config = anchor_pane.get_config();
+
+        // Spawn the pane at the anchor's current size (placeholder; termob
+        // resizes it to the egui tile size afterwards). No split-size compute.
+        let spawn_size = anchor_pane.get_dimensions();
+        let size = TerminalSize {
+            cols: spawn_size.cols,
+            rows: spawn_size.viewport_rows,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: spawn_size.dpi,
+        };
+
+        let (command, command_dir) = match source {
+            SplitSource::Spawn {
+                command,
+                command_dir,
+            } => (
+                command,
+                self.resolve_cwd(
+                    command_dir,
+                    Some(Arc::clone(&anchor_pane)),
+                    domain.domain_id(),
+                    CachePolicy::FetchImmediate,
+                ),
+            ),
+            SplitSource::MovePane(_) => {
+                anyhow::bail!("add_pane_to_tab does not support MovePane");
+            }
+        };
+
+        let pane = domain.spawn_pane(size, command, command_dir).await?;
+        if let Some(config) = term_config {
+            pane.set_config(config);
+        }
+
+        let tab = self
+            .get_tab(tab_id)
+            .ok_or_else(|| anyhow!("tab {} invalid", tab_id))?;
+        tab.add_pane_no_split(anchor_pane_id, Arc::clone(&pane))?;
+
+        let dims = pane.get_dimensions();
+        let size = TerminalSize {
+            cols: dims.cols,
+            rows: dims.viewport_rows,
+            pixel_height: 0,
+            pixel_width: 0,
+            dpi: dims.dpi,
+        };
+
+        // Notify subscribers (same as split_pane's spawn path does implicitly).
+        self.notify(MuxNotification::PaneAdded(pane.pane_id()));
+
+        Ok((pane, size))
+    }
+
     pub async fn split_pane(
         &self,
         // TODO: disambiguate with TabId
