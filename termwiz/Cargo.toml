@@ -63,8 +63,16 @@ k9.workspace = true
 
 [target."cfg(unix)".dependencies]
 signal-hook.workspace = true
-termios.workspace = true
 nix = {workspace=true, features=["mman", "fs"]}
+
+# `termios` crate (0.3.x) does not declare iOS/tvOS/watchOS/visionOS
+# `target_os` cfg branches, so it fails to compile on Apple mobile
+# targets. The terminfo renderer and Unix terminal driver only use
+# termios for raw-mode TTY setup on real interactive terminals; mobile
+# targets never run these code paths. Restrict the dependency to
+# desktop-class unix targets to keep the workspace cross-compilable.
+[target."cfg(all(unix, not(any(target_os = \"ios\", target_os = \"tvos\", target_os = \"watchos\", target_os = \"visionos\"))))".dependencies]
+termios.workspace = true
 
 [target."cfg(windows)".dependencies.winapi]
 features = [

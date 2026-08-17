@@ -4,8 +4,23 @@ use crate::caps::probed::ProbeCapabilities;
 use crate::caps::Capabilities;
 use crate::input::InputEvent;
 use crate::surface::Change;
-use crate::{format_err, Result};
+use crate::Result;
+#[cfg(any(
+    windows,
+    all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))
+))]
+use crate::format_err;
+#[cfg(all(unix, any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))]
+use crate::bail;
+#[cfg(any(
+    windows,
+    all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))
+))]
 use num_traits::NumCast;
+#[cfg(any(
+    windows,
+    all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))
+))]
 use std::fmt::Display;
 use std::time::Duration;
 
@@ -14,17 +29,43 @@ use serde::Deserialize;
 #[cfg(feature = "use_serde")]
 use serde::Serialize;
 
-#[cfg(unix)]
+// `unix` module pulls in the `termios` crate which lacks Apple-mobile
+// `target_os` cfg branches; gate it off iOS/tvOS/watchOS/visionOS.
+// Mobile consumers don't run on a real TTY so the UnixTerminal driver
+// is never instantiated there anyway.
+#[cfg(all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))))]
 pub mod unix;
 #[cfg(windows)]
 pub mod windows;
 
 pub mod buffered;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))))]
 pub use self::unix::{UnixTerminal, UnixTerminalWaker as TerminalWaker};
 #[cfg(windows)]
 pub use self::windows::{WindowsTerminal, WindowsTerminalWaker as TerminalWaker};
+
+// On Apple mobile targets the UnixTerminal driver is gated off (no
+// termios support there), so there's no concrete waker type to alias.
+// Keep the public `TerminalWaker` symbol available as a stub so that
+// the `Terminal` trait and downstream callers like `lineedit` still
+// type-check. Constructing one isn't supported — code paths that need
+// a real waker only run on the gated-out UnixTerminal.
+#[cfg(all(unix, any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))]
+#[derive(Clone)]
+pub struct TerminalWaker;
+
+#[cfg(all(unix, any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))]
+impl TerminalWaker {
+    /// Stub: waking is unsupported on Apple mobile targets where there
+    /// is no UnixTerminal to wake.
+    pub fn wake(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "TerminalWaker is unavailable on Apple mobile targets",
+        ))
+    }
+}
 
 /// Represents the size of the terminal screen.
 /// The number of rows and columns of character cells are expressed.
@@ -112,7 +153,7 @@ pub trait Terminal {
 /// Ideally you wouldn't reference `SystemTerminal` in consuming
 /// code.  This type is exposed for convenience if you are doing
 /// something unusual and want easier access to the constructors.
-#[cfg(unix)]
+#[cfg(all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))))]
 pub type SystemTerminal = UnixTerminal;
 #[cfg(windows)]
 pub type SystemTerminal = WindowsTerminal;
@@ -126,10 +167,46 @@ pub type SystemTerminal = WindowsTerminal;
 /// If you have a more advanced use case you will want to look to the
 /// constructors for `UnixTerminal` and `WindowsTerminal` and call whichever
 /// one is most suitable for your needs.
+#[cfg(any(windows, all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))))]
 pub fn new_terminal(caps: Capabilities) -> Result<impl Terminal> {
     SystemTerminal::new(caps)
 }
 
+// Apple mobile targets have no UnixTerminal driver (termios crate
+// lacks the cfg branch). Provide a never-succeeding stub so that
+// callers like `lineedit::line_editor_terminal` still type-check on
+// these targets — they're not expected to be invoked at runtime.
+#[cfg(all(unix, any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))]
+pub fn new_terminal(_caps: Capabilities) -> Result<MobileStubTerminal> {
+    bail!("new_terminal is unavailable on Apple mobile targets");
+}
+
+/// Uninhabited terminal placeholder for Apple mobile targets where the
+/// real `UnixTerminal` cannot be built.
+#[cfg(all(unix, any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))]
+pub enum MobileStubTerminal {}
+
+#[cfg(all(unix, any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))]
+impl Terminal for MobileStubTerminal {
+    fn set_raw_mode(&mut self) -> Result<()> { match *self {} }
+    fn set_cooked_mode(&mut self) -> Result<()> { match *self {} }
+    fn enter_alternate_screen(&mut self) -> Result<()> { match *self {} }
+    fn exit_alternate_screen(&mut self) -> Result<()> { match *self {} }
+    fn get_screen_size(&mut self) -> Result<ScreenSize> { match *self {} }
+    fn set_screen_size(&mut self, _size: ScreenSize) -> Result<()> { match *self {} }
+    fn render(&mut self, _changes: &[Change]) -> Result<()> { match *self {} }
+    fn flush(&mut self) -> Result<()> { match *self {} }
+    fn poll_input(&mut self, _wait: Option<Duration>) -> Result<Option<InputEvent>> { match *self {} }
+    fn waker(&self) -> TerminalWaker { match *self {} }
+}
+
+// Only the `unix` and `windows` driver modules consume `cast`; on Apple
+// mobile targets both are cfg-gated off, leaving the helper unused.
+// Match the same cfg so the dead-code lint stays satisfied.
+#[cfg(any(
+    windows,
+    all(unix, not(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos")))
+))]
 pub(crate) fn cast<T: NumCast + Display + Copy, U: NumCast>(n: T) -> Result<U> {
     num_traits::cast(n).ok_or_else(|| format_err!("{} is out of bounds for this system", n))
 }
