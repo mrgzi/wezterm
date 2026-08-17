@@ -23,7 +23,8 @@ use termwiz::render::terminfo::TerminfoRenderer;
 use termwiz::surface::{Change, LineAttribute};
 use termwiz::terminal::{ScreenSize, Terminal, TerminalWaker};
 use wezterm_ssh::{
-    ConfigMap, HostVerificationFailed, Session, SessionEvent, SshChildProcess, SshPty,
+    AuthPromptOrigin, ConfigMap, HostVerificationFailed, Session, SessionEvent, SshChildProcess,
+    SshPty,
 };
 use wezterm_term::TerminalSize;
 
@@ -109,10 +110,31 @@ pub fn ssh_connect_with_ui(
                         for line in &prompt_lines {
                             ui.output_str(&format!("{}\n", line));
                         }
+                        // Termob fork: a secret prompt carries WHERE IT CAME
+                        // FROM, so an embedded responder can refuse to answer a
+                        // server-composed prompt with a local-only secret (the
+                        // passphrase of a key file on this machine). Text
+                        // matching cannot substitute for this — over
+                        // keyboard-interactive the server writes the prompt
+                        // itself and would simply imitate the local wording.
+                        let origin = match auth.origin {
+                            AuthPromptOrigin::Local => crate::connui::AUTH_ORIGIN_LOCAL,
+                            AuthPromptOrigin::Server => crate::connui::AUTH_ORIGIN_SERVER,
+                        };
+                        // The origin travels on the echoing branch too. Without
+                        // it the context arrives as `None`, and the responder
+                        // falls back to the buffered output — which the SERVER
+                        // wrote. A prompt whose text happens to match the
+                        // host-key question would then be handed to the
+                        // host-key verifier with server-authored text as its
+                        // fingerprint. Carrying the origin lets the responder
+                        // tell an auth prompt from a real host verification,
+                        // which is the only durable distinction: the text is
+                        // the attacker's to choose.
                         let res = if prompt.echo {
-                            ui.input(editor_prompt)
+                            ui.input_with_context(editor_prompt, origin)
                         } else {
-                            ui.password(editor_prompt)
+                            ui.password_with_context(editor_prompt, origin)
                         };
                         if let Ok(line) = res {
                             answers.push(line);
