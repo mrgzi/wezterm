@@ -78,14 +78,21 @@ pub fn ssh_connect_with_ui(
                 }
                 SessionEvent::HostVerify(verify) => {
                     ui.output_str(&format!("{}\n", verify.message));
-                    let ok = if let Ok(line) = ui.input("Enter [y/n]> ") {
-                        match line.as_ref() {
-                            "y" | "Y" | "yes" | "YES" => true,
-                            "n" | "N" | "no" | "NO" | _ => false,
-                        }
-                    } else {
-                        false
-                    };
+                    // The message also travels TYPED alongside the prompt:
+                    // an embedded responder (ResponderImpl) must not have to
+                    // recover it from the Output stream, where the
+                    // server-controlled banner (printed above) could spoof a
+                    // fingerprint-looking line. Overlay/headless UIs ignore
+                    // the context; the output_str above keeps their display.
+                    let ok =
+                        if let Ok(line) = ui.input_with_context("Enter [y/n]> ", &verify.message) {
+                            match line.as_ref() {
+                                "y" | "Y" | "yes" | "YES" => true,
+                                "n" | "N" | "no" | "NO" | _ => false,
+                            }
+                        } else {
+                            false
+                        };
                     smol::block_on(verify.answer(ok)).context("send verify response")?;
                 }
                 SessionEvent::Authenticate(auth) => {

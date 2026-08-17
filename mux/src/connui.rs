@@ -44,6 +44,15 @@ pub enum UIRequest {
     Input {
         prompt: String,
         echo: bool,
+        /// Typed provenance for what this prompt refers to, when the caller
+        /// has it (see [`ConnectionUI::input_with_context`]). Host-key
+        /// verification passes the client-computed host/fingerprint message
+        /// here so an embedded responder does not have to recover it from the
+        /// accumulated `Output` stream, where it would sit next to
+        /// server-controlled text such as the SSH banner — which arrives
+        /// *before* verification and could spoof a fingerprint-looking line.
+        /// Terminal-overlay and headless impls ignore this field.
+        context: Option<String>,
         respond: Promise<String>,
     },
     /// Sleep with a progress bar
@@ -76,6 +85,7 @@ impl ConnectionUIImpl {
                     prompt,
                     echo: true,
                     mut respond,
+                    ..
                 }) => {
                     respond.result(self.input_prompt(&prompt));
                 }
@@ -83,6 +93,7 @@ impl ConnectionUIImpl {
                     prompt,
                     echo: false,
                     mut respond,
+                    ..
                 }) => {
                     respond.result(self.password_prompt(&prompt));
                 }
@@ -370,6 +381,22 @@ impl ConnectionUI {
     }
 
     pub fn input(&self, prompt: &str) -> anyhow::Result<String> {
+        self.input_impl(prompt, None)
+    }
+
+    /// Like [`Self::input`], but also carries a typed `context` describing
+    /// what the prompt refers to. SSH host-key verification passes the
+    /// client-computed host/fingerprint message here so an embedded responder
+    /// (see [`Self::new_with_input_responder`]) receives it separately from
+    /// the accumulated `Output` stream — that stream also carries
+    /// server-controlled text (the SSH banner, printed *before* verification),
+    /// which could otherwise spoof a fingerprint-looking line. Terminal
+    /// overlay and headless UIs ignore the context.
+    pub fn input_with_context(&self, prompt: &str, context: &str) -> anyhow::Result<String> {
+        self.input_impl(prompt, Some(context.to_string()))
+    }
+
+    fn input_impl(&self, prompt: &str, context: Option<String>) -> anyhow::Result<String> {
         let mut promise = Promise::new();
         let future = promise.get_future().unwrap();
 
@@ -382,6 +409,7 @@ impl ConnectionUI {
             .send(UIRequest::Input {
                 prompt,
                 echo: true,
+                context,
                 respond: promise,
             })
             .context("send to ConnectionUI failed")?;
@@ -402,6 +430,7 @@ impl ConnectionUI {
             .send(UIRequest::Input {
                 prompt,
                 echo: false,
+                context: None,
                 respond: promise,
             })
             .context("send to ConnectionUI failed")?;
