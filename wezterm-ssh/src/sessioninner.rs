@@ -184,14 +184,16 @@ impl SessionInner {
         if let Some(agent) = self.config.get("identityagent") {
             sess.set_option(libssh_rs::SshOption::IdentityAgent(Some(agent.clone())))?;
         }
+        // Termob fork: `split_path_list` rather than `split_whitespace` so a
+        // path containing a space survives; see its doc comment.
         if let Some(files) = self.config.get("identityfile") {
-            for file in files.split_whitespace() {
-                sess.set_option(libssh_rs::SshOption::AddIdentity(file.to_string()))?;
+            for file in crate::config::split_path_list(files) {
+                sess.set_option(libssh_rs::SshOption::AddIdentity(file))?;
             }
         }
         if let Some(kh) = self.config.get("userknownhostsfile") {
-            for file in kh.split_whitespace() {
-                sess.set_option(libssh_rs::SshOption::KnownHosts(Some(file.to_string())))?;
+            for file in crate::config::split_path_list(kh) {
+                sess.set_option(libssh_rs::SshOption::KnownHosts(Some(file)))?;
                 break;
             }
         }
@@ -398,9 +400,40 @@ impl SessionInner {
                 .with_context(|| format!("binding to {bind_addr:?}"))?;
         }
 
-        sock.connect(&addr.into())
-            .with_context(|| format!("Connecting to {hostname}:{port} ({addr:?})"))?;
+        let timeout = self.connect_timeout();
+        sock.connect_timeout(&addr.into(), timeout)
+            .with_context(|| {
+                format!("Connecting to {hostname}:{port} ({addr:?}) within {timeout:?}")
+            })?;
         Ok((sock, None))
+    }
+
+    /// How long the TCP handshake above may take before the attempt is
+    /// abandoned.
+    ///
+    /// Termob fork. `Socket::connect` carries no timeout of its own, so
+    /// against a peer that silently drops SYNs — a firewall, a stale LAN
+    /// address, a phone that has roamed off the network — it blocks for the OS
+    /// retry budget: roughly 75s on macOS and 130s on Linux. The TLS transport
+    /// already bounds this (`TlsDomainClient::connect_timeout`), but the SSH
+    /// one did not, and the two meet: fetching TLS credentials over SSH runs
+    /// this code on the FIRST connection of the picker's default mode. Leaving
+    /// it unbounded meant the same address failed after ~75s on the first
+    /// attempt and after 10s on the second, once credentials were cached.
+    ///
+    /// `connecttimeout` is OpenSSH's own option name, so a caller that already
+    /// speaks ssh_config can set it. **A value of 0 selects the default here
+    /// rather than "no limit"**, which is where OpenSSH would fall back to the
+    /// system default: an unbounded connect is precisely the behaviour this
+    /// exists to remove, so there is deliberately no way to ask for it back.
+    fn connect_timeout(&self) -> Duration {
+        const DEFAULT: Duration = Duration::from_secs(10);
+        self.config
+            .get("connecttimeout")
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .filter(|d| !d.is_zero())
+            .unwrap_or(DEFAULT)
     }
 
     /// Used to restrict to_socket_addrs results to the address
