@@ -31,7 +31,7 @@ fn schedule_all(lua: Option<Rc<mlua::Lua>>) -> mlua::Result<()> {
 /// Helper to schedule !Send futures to run with access to the lua
 /// config on the main thread
 fn schedule_trampoline() {
-    promise::spawn::spawn(async move {
+    promise::spawn::spawn_local_inline(async move {
         config::with_lua_config_on_main_thread(|lua| async move {
             schedule_all(lua)?;
             Ok(())
@@ -81,7 +81,7 @@ impl ScheduledEvent {
     /// reload, or 4 times for the second and so on.
     fn schedule(self, generation: usize) {
         let event = self;
-        promise::spawn::spawn(async move {
+        promise::spawn::spawn_local_inline(async move {
             config::with_lua_config_on_main_thread(move |lua| async move {
                 if let Some(lua) = lua {
                     event.run(&lua, generation).await?;
