@@ -5,6 +5,86 @@ use std::path::{Path, PathBuf};
 
 pub type ConfigMap = BTreeMap<String, String>;
 
+/// Is `key` an option whose value is a whitespace-separated list of paths?
+///
+/// These are the options that [`split_path_list`] must be used to read and
+/// [`quote_path_for_list`] must be used to write.
+fn is_path_list_option(key: &str) -> bool {
+    matches!(key, "identityfile" | "userknownhostsfile")
+}
+
+/// Split a whitespace-separated ssh_config path list into individual paths,
+/// honouring double quotes.
+///
+/// Termob fork. ssh_config encodes a *list* of paths in a single option value
+/// separated by whitespace (`identityfile` explicitly accumulates across
+/// entries), so `split_whitespace` alone cannot recover a path that itself
+/// contains a space: it silently becomes two paths that do not exist, the key
+/// or known_hosts file is skipped, and authentication fails with no
+/// diagnostic pointing at the real cause. This is reachable without any exotic
+/// configuration — the built-in defaults are built from `$HOME`, and a Windows
+/// account named "John Doe" has a space in it. OpenSSH's own answer is to
+/// allow the argument to be double quoted; [`quote_path_for_list`] produces
+/// that encoding and this reverses it.
+///
+/// Quoting is only recognised when a token *starts* with `"`, matching how the
+/// config file parser detects a quoted value. A path that merely contains a
+/// quote (`/tmp/a"b`) is returned untouched, exactly as before. A path
+/// containing both a quote and whitespace cannot be represented and is not
+/// expected to round-trip. An unterminated quote consumes the rest of the
+/// value rather than dropping it.
+pub fn split_path_list(value: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut open: Option<String> = None;
+
+    for token in value.split_whitespace() {
+        if let Some(acc) = open.as_mut() {
+            // Inside a quoted entry: the split above ate the separator, so put
+            // a single space back. Runs of whitespace inside a quoted path are
+            // collapsed; ssh_config has no way to preserve them anyway.
+            acc.push(' ');
+            match token.strip_suffix('"') {
+                Some(rest) => {
+                    acc.push_str(rest);
+                    if let Some(done) = open.take() {
+                        result.push(done);
+                    }
+                }
+                None => acc.push_str(token),
+            }
+            continue;
+        }
+
+        match token.strip_prefix('"') {
+            Some(rest) => match rest.strip_suffix('"') {
+                // `"/a/b"` — quoted but with nothing to join.
+                Some(inner) => result.push(inner.to_string()),
+                None => open = Some(rest.to_string()),
+            },
+            None => result.push(token.to_string()),
+        }
+    }
+
+    if let Some(unterminated) = open.take() {
+        result.push(unterminated);
+    }
+
+    result
+}
+
+/// Encode a single path for inclusion in a whitespace-separated ssh_config
+/// path list; the inverse of [`split_path_list`].
+///
+/// Only paths containing whitespace are quoted, so every value that worked
+/// before is byte-for-byte unchanged.
+pub fn quote_path_for_list(path: &str) -> String {
+    if path.chars().any(char::is_whitespace) {
+        format!("\"{path}\"")
+    } else {
+        path.to_string()
+    }
+}
+
 /// A Pattern in a `Host` list
 #[derive(Debug, PartialEq, Eq, Clone)]
 struct Pattern {
@@ -243,11 +323,15 @@ impl ParsedConfigFile {
                 let k = k.trim().to_lowercase();
                 let v = v[1..].trim();
 
-                let v = if v.starts_with('"') && v.ends_with('"') {
-                    &v[1..v.len() - 1]
-                } else {
-                    v
-                };
+                // Termob fork: remember whether the quotes were there. A path
+                // list has to be re-quoted before it is stored (see
+                // `add_option`), and "was it quoted" is the only thing that
+                // distinguishes ONE path containing a space from SEVERAL
+                // paths. The `len() >= 2` guard is also a fix: a value of a
+                // single `"` satisfies both `starts_with` and `ends_with`, and
+                // the slice below would then panic on `1..0`.
+                let was_quoted = v.len() >= 2 && v.starts_with('"') && v.ends_with('"');
+                let v = if was_quoted { &v[1..v.len() - 1] } else { v };
 
                 fn parse_pattern_list(v: &str) -> Vec<Pattern> {
                     let mut patterns = vec![];
@@ -343,25 +427,42 @@ impl ParsedConfigFile {
                     continue;
                 }
 
-                fn add_option(options: &mut ConfigMap, k: String, v: &str) {
+                fn add_option(options: &mut ConfigMap, k: String, v: &str, was_quoted: bool) {
                     // first option wins in ssh_config, except for identityfile
                     // which explicitly allows multiple entries to combine together
                     let is_identity_file = k == "identityfile";
+                    // Termob fork: put back the quotes the parser stripped, so
+                    // that `split_path_list` can tell ONE path containing a
+                    // space from SEVERAL paths.
+                    //
+                    // Restoring only what was actually quoted is the whole
+                    // point. An unquoted value may legitimately BE a list —
+                    // `UserKnownHostsFile ~/a ~/b` is two files, and the
+                    // built-in default is likewise two — so quoting every path
+                    // list unconditionally would collapse those into a single
+                    // nonexistent path. Non-path options are never touched;
+                    // wrapping something like `proxycommand` would corrupt a
+                    // command line.
+                    let v = if was_quoted && is_path_list_option(&k) {
+                        quote_path_for_list(v)
+                    } else {
+                        v.to_string()
+                    };
                     options
                         .entry(k)
                         .and_modify(|e| {
                             if is_identity_file {
                                 e.push(' ');
-                                e.push_str(v);
+                                e.push_str(&v);
                             }
                         })
-                        .or_insert_with(|| v.to_string());
+                        .or_insert(v);
                 }
 
                 if let Some(group) = groups.last_mut() {
-                    add_option(&mut group.options, k, v);
+                    add_option(&mut group.options, k, v, was_quoted);
                 } else {
-                    add_option(options, k, v);
+                    add_option(options, k, v, was_quoted);
                 }
             }
         }
@@ -560,6 +661,34 @@ impl Config {
         );
 
         for (k, v) in &mut result {
+            // Termob fork: a path list is expanded ENTRY BY ENTRY and re-encoded.
+            //
+            // Expansion is what introduces the space: `IdentityFile ~/.ssh/id_rsa`
+            // carries none when it is parsed, so `add_option` has nothing to
+            // quote, and `~` only becomes `/Users/John Doe/...` here. Expanding
+            // the joined value and leaving it unquoted would then hand
+            // `split_path_list` a string it must take apart at the wrong place,
+            // and the key the user explicitly configured is silently skipped —
+            // the exact failure quoting exists to prevent, just arriving one
+            // step later. Splitting first is what makes this exact: at that
+            // point the quoting still says how many paths there are.
+            if is_path_list_option(k) {
+                let expanded = split_path_list(v)
+                    .into_iter()
+                    .map(|mut entry| {
+                        if let Some(tokens) = self.should_expand_tokens(k) {
+                            self.expand_tokens(&mut entry, tokens, &token_map);
+                        }
+                        if self.should_expand_environment(k) {
+                            self.expand_environment(&mut entry);
+                        }
+                        quote_path_for_list(&entry)
+                    })
+                    .collect::<Vec<_>>();
+                *v = expanded.join(" ");
+                continue;
+            }
+
             if let Some(tokens) = self.should_expand_tokens(k) {
                 self.expand_tokens(v, tokens, &token_map);
             }
@@ -577,11 +706,24 @@ impl Config {
             .entry("user".to_string())
             .or_insert_with(|| target_user.clone());
 
+        // Termob fork: the defaults below are built from `$HOME`, which can
+        // contain a space (`C:\Users\John Doe`, `/Users/John Doe`). Joining
+        // them raw produced a list that `split_path_list` would take apart at
+        // the wrong place, so every user with a spaced home silently had no
+        // known_hosts file and no default identities.
+        fn join_paths_under_home(home: &str, names: &[&str]) -> String {
+            names
+                .iter()
+                .map(|name| quote_path_for_list(&format!("{home}/{name}")))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
         if !result.contains_key("userknownhostsfile") {
             if let Some(home) = self.resolve_home() {
                 result.insert(
                     "userknownhostsfile".to_string(),
-                    format!("{}/.ssh/known_hosts {}/.ssh/known_hosts2", home, home,),
+                    join_paths_under_home(&home, &[".ssh/known_hosts", ".ssh/known_hosts2"]),
                 );
             }
         }
@@ -590,9 +732,14 @@ impl Config {
             if let Some(home) = self.resolve_home() {
                 result.insert(
                     "identityfile".to_string(),
-                    format!(
-                        "{}/.ssh/id_dsa {}/.ssh/id_ecdsa {}/.ssh/id_ed25519 {}/.ssh/id_rsa",
-                        home, home, home, home
+                    join_paths_under_home(
+                        &home,
+                        &[
+                            ".ssh/id_dsa",
+                            ".ssh/id_ecdsa",
+                            ".ssh/id_ed25519",
+                            ".ssh/id_rsa",
+                        ],
                     ),
                 );
             }
@@ -693,6 +840,9 @@ impl Config {
                         .split_whitespace()
                         .map(|s| s.to_string())
                         .collect::<Vec<String>>();
+                    // Termob fork note: path lists reach this function one
+                    // UNQUOTED entry at a time (see `for_host`), so there is no
+                    // quoting to see through here.
                     for item in &mut items {
                         if item.starts_with("~/") {
                             item.replace_range(0..1, &home);
@@ -802,6 +952,151 @@ impl Config {
 mod test {
     use super::*;
     use k9::snapshot;
+
+    // Termob fork: path lists with spaces. The round-trip is what matters —
+    // a writer quotes, a reader splits, and everything that never had a space
+    // must come back byte-for-byte unchanged.
+
+    #[test]
+    fn split_path_list_leaves_ordinary_lists_alone() {
+        assert_eq!(
+            split_path_list("/home/me/.ssh/id_ed25519 /home/me/.ssh/id_rsa"),
+            vec!["/home/me/.ssh/id_ed25519", "/home/me/.ssh/id_rsa"]
+        );
+        assert_eq!(split_path_list(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn split_path_list_recovers_quoted_paths() {
+        assert_eq!(
+            split_path_list("\"/Users/John Doe/.ssh/id_rsa\""),
+            vec!["/Users/John Doe/.ssh/id_rsa"]
+        );
+        // Quoted and unquoted entries mixed in one list.
+        assert_eq!(
+            split_path_list("/etc/key \"/Users/John Doe/k\" /tmp/other"),
+            vec!["/etc/key", "/Users/John Doe/k", "/tmp/other"]
+        );
+        // Quoted, but with no space to join across.
+        assert_eq!(split_path_list("\"/etc/key\""), vec!["/etc/key"]);
+    }
+
+    #[test]
+    fn split_path_list_keeps_pathological_input() {
+        // An embedded quote is not a quoted entry; it stays literal, which is
+        // exactly what `split_whitespace` did before.
+        assert_eq!(split_path_list("/tmp/a\"b"), vec!["/tmp/a\"b"]);
+        // An unterminated quote yields the rest of the value rather than
+        // silently dropping the path.
+        assert_eq!(split_path_list("\"/a b/c"), vec!["/a b/c"]);
+    }
+
+    #[test]
+    fn quote_path_for_list_only_touches_spaced_paths() {
+        assert_eq!(
+            quote_path_for_list("/home/me/.ssh/id_rsa"),
+            "/home/me/.ssh/id_rsa"
+        );
+        assert_eq!(
+            quote_path_for_list("/Users/John Doe/k"),
+            "\"/Users/John Doe/k\""
+        );
+    }
+
+    #[test]
+    fn quoted_path_round_trips_through_the_list_encoding() {
+        let paths = ["/etc/plain", "/Users/John Doe/k", "/a/b c/d e/f"];
+        let encoded = paths
+            .iter()
+            .map(|p| quote_path_for_list(p))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(split_path_list(&encoded), paths);
+    }
+
+    #[test]
+    fn config_file_quoted_identity_file_is_preserved() {
+        let mut config = Config::new();
+        config.add_config_string(
+            r#"
+        Host foo
+            IdentityFile "/Users/John Doe/.ssh/id_rsa"
+            "#,
+        );
+        let opts = config.for_host("foo");
+        let files = opts.get("identityfile").map(String::as_str).unwrap_or("");
+        assert_eq!(
+            split_path_list(files),
+            vec!["/Users/John Doe/.ssh/id_rsa"],
+            "quoted IdentityFile lost its space: {files}"
+        );
+    }
+
+    /// The counterpart of the test above, and the reason quoting is restored
+    /// rather than applied to every path list: an UNQUOTED value may already
+    /// BE a list. Quoting it wholesale would turn two real files into one
+    /// nonexistent path.
+    #[test]
+    fn config_file_unquoted_path_list_stays_a_list() {
+        let mut config = Config::new();
+        config.add_config_string(
+            r#"
+        Host foo
+            UserKnownHostsFile /etc/kh1 /etc/kh2
+            "#,
+        );
+        let opts = config.for_host("foo");
+        let files = opts
+            .get("userknownhostsfile")
+            .map(String::as_str)
+            .unwrap_or("");
+        assert_eq!(split_path_list(files), vec!["/etc/kh1", "/etc/kh2"]);
+    }
+
+    /// A home directory with a space in it is the common case, not an exotic
+    /// one (`/Users/John Doe`, `C:\Users\John Doe`). The space does not exist
+    /// when the line is parsed — `~` is still one character — so quoting has to
+    /// survive expansion, not just parsing. Before this, the user's explicitly
+    /// configured key was split into two nonexistent paths and silently never
+    /// tried.
+    #[test]
+    fn tilde_expansion_keeps_a_spaced_home_in_one_piece() {
+        let mut config = Config::new();
+        config.add_config_string(
+            r#"
+        Host foo
+            IdentityFile ~/.ssh/id_rsa
+            "#,
+        );
+        // `resolve_home` reads HOME from here, so the spaced home is injected
+        // rather than depending on whoever runs the test.
+        let mut env = ConfigMap::new();
+        env.insert("HOME".to_string(), "/Users/John Doe".to_string());
+        config.assign_environment(env);
+        let opts = config.for_host("foo");
+        let files = opts.get("identityfile").map(String::as_str).unwrap_or("");
+        let split = split_path_list(files);
+        assert_eq!(
+            split.len(),
+            1,
+            "spaced home split the key into {split:?} (raw: {files})"
+        );
+    }
+
+    /// A value of a single `"` satisfies both `starts_with('"')` and
+    /// `ends_with('"')`; slicing `1..len-1` on it panics. Parsing a config
+    /// file must not be able to bring the process down.
+    #[test]
+    fn config_file_lone_quote_does_not_panic() {
+        let mut config = Config::new();
+        config.add_config_string(
+            r#"
+        Host foo
+            IdentityFile "
+            "#,
+        );
+        let _ = config.for_host("foo");
+    }
 
     #[test]
     fn parse_keepalive() {
