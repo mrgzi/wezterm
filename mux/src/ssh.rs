@@ -213,6 +213,18 @@ pub struct RemoteSshDomain {
     name: String,
 }
 
+/// Termob fork: the `ssh_option` key carrying a password the embedder already
+/// collected from the user.
+///
+/// It is answered to the server's first non-echoing authentication prompt
+/// instead of the line editor this file runs inside the pane, so a connection
+/// the user has already supplied a password for does not ask for it again.
+///
+/// **It is taken out of the map and never reaches the ssh config.** The config
+/// is logged in full when `wezterm_ssh_verbose` is set, and wezterm-ssh has no
+/// use for the value in any case.
+pub const TERMOB_PASSWORD_OPTION: &str = "termob_password";
+
 pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap> {
     let mut ssh_config = wezterm_ssh::Config::new();
     ssh_config.add_default_config_files();
@@ -240,6 +252,12 @@ pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap
         .to_string(),
     );
     for (k, v) in &ssh_dom.ssh_option {
+        // Termob fork: the password is for the auth responder in this file, not
+        // for the ssh config — and the config below is logged in full when
+        // `wezterm_ssh_verbose` is set.
+        if k == TERMOB_PASSWORD_OPTION {
+            continue;
+        }
         ssh_config.insert(k.to_string(), v.to_string());
     }
 
@@ -426,6 +444,15 @@ impl RemoteSshDomain {
         // to perform the blocking (from its perspective) terminal
         // UI to carry out any authentication.
         let mut stdout_write = BufWriter::new(stdout_write);
+        // Termob fork: read straight off the domain rather than out of the ssh
+        // config, which deliberately never carries it — see
+        // `TERMOB_PASSWORD_OPTION`.
+        let supplied_password = self
+            .dom
+            .ssh_option
+            .get(TERMOB_PASSWORD_OPTION)
+            .filter(|p| !p.is_empty())
+            .cloned();
         std::thread::spawn(move || {
             if let Err(err) = connect_ssh_session(
                 session,
@@ -439,6 +466,7 @@ impl RemoteSshDomain {
                 size,
                 command_line,
                 env,
+                supplied_password,
             ) {
                 let _ = write!(stdout_write, "{:#}", err);
                 log::error!("Failed to connect ssh: {:#}", err);
@@ -469,6 +497,9 @@ fn connect_ssh_session(
     size: Arc<Mutex<TerminalSize>>,
     command_line: Option<String>,
     env: HashMap<String, String>,
+    // Termob fork: a password the embedder already has, answered to the first
+    // non-echoing prompt. See `TERMOB_PASSWORD_OPTION`.
+    mut supplied_password: Option<String>,
 ) -> anyhow::Result<()> {
     struct StdoutShim<'a> {
         size: Arc<Mutex<TerminalSize>>,
@@ -661,6 +692,18 @@ fn connect_ssh_session(
                 }
                 let mut answers = vec![];
                 for prompt in &auth.prompts {
+                    // Termob fork: a password the embedder collected answers the
+                    // first prompt that hides what is typed. `take` rather than
+                    // a clone on purpose — a password the server refuses would
+                    // otherwise be offered to every retry in turn and the user
+                    // would never be asked, so the second prompt falls through
+                    // to the line editor below.
+                    if !prompt.echo {
+                        if let Some(password) = supplied_password.take() {
+                            answers.push(password);
+                            continue;
+                        }
+                    }
                     let mut prompt_lines = prompt.prompt.split('\n').collect::<Vec<_>>();
                     let editor_prompt = prompt_lines.pop().unwrap();
                     for line in &prompt_lines {
