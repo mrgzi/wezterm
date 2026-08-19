@@ -281,6 +281,30 @@ impl crate::sessioninner::SessionInner {
             }
 
             if auth_methods.contains(AuthMethods::INTERACTIVE) {
+                // How many refusals are answered here before the next method
+                // is tried.
+                //
+                // Refusing once ended the method outright. Where the server also
+                // offers `password` that costs nothing — the branch below asks
+                // again — but a server offering ONLY keyboard-interactive
+                // (`PasswordAuthentication no`, `KbdInteractiveAuthentication
+                // yes`, which is how PAM logins are commonly configured) fell
+                // straight through to "unhandled auth case", and the session
+                // died on a single mistype.
+                //
+                // Bounded rather than left to the server, unlike the password
+                // branch below: a 2FA challenge that keeps being refused must
+                // still fall through to the other methods rather than hold the
+                // connection here. Three matches OpenSSH's own
+                // `NumberOfPasswordPrompts`.
+                //
+                // Refusals are counted, not prompts: one PAM conversation can
+                // arrive as several `Info` rounds — a banner with no prompts,
+                // then the password — and counting those would spend the budget
+                // on a single attempt.
+                const INTERACTIVE_ATTEMPTS: usize = 3;
+                let mut denials = 0usize;
+                let mut answered_this_round = false;
                 loop {
                     match sess.userauth_keyboard_interactive(None, None)? {
                         AuthStatus::Success => return Ok(()),
@@ -311,10 +335,22 @@ impl crate::sessioninner::SessionInner {
 
                             sess.userauth_keyboard_interactive_set_answers(&answers)?;
 
+                            answered_this_round = true;
                             continue;
                         }
                         AuthStatus::Denied => {
-                            break;
+                            // A denial the server reached without asking us
+                            // anything is the method saying no, not this answer
+                            // being wrong: go on to the next one.
+                            if !answered_this_round {
+                                break;
+                            }
+                            denials += 1;
+                            if denials >= INTERACTIVE_ATTEMPTS {
+                                break;
+                            }
+                            answered_this_round = false;
+                            continue;
                         }
                         AuthStatus::Partial => continue,
                         status => {
@@ -325,28 +361,75 @@ impl crate::sessioninner::SessionInner {
             }
 
             if auth_methods.contains(AuthMethods::PASSWORD) {
-                let (reply, answers) = bounded(1);
-                self.tx_event
-                    .try_send(SessionEvent::Authenticate(AuthenticationEvent {
-                        username: "".to_string(),
-                        instructions: "".to_string(),
-                        prompts: vec![AuthenticationPrompt {
-                            prompt: "Password: ".to_string(),
-                            echo: false,
-                        }],
-                        // Termob fork: ssh2 password auth: answer is sent to the server.
-                        origin: AuthPromptOrigin::Server,
-                        reply,
-                    }))
-                    .unwrap();
+                // A REFUSED password is asked for again rather than ending the
+                // session.
+                //
+                // **This same file already does that on the other backend.** The
+                // ssh2 path below logs a failed `userauth_password` and lets its
+                // loop re-query the methods and prompt again; the libssh path —
+                // the default — bailed on the first denial instead. One mistyped
+                // password therefore killed the session, and the pane was left
+                // showing `password auth status: Denied` with no way back.
+                // `ssh(1)` gives three tries, and so does every other client.
+                //
+                // The count is left to the server rather than fixed here: `sshd`
+                // disconnects after `MaxAuthTries`, and that error surfaces
+                // through the `?` below.
+                //
+                // Termob additionally: the FIRST prompt may be answered out of
+                // band, from a password the embedder collected before the pane
+                // existed (`mux::ssh::TERMOB_PASSWORD_OPTION`). The first denial
+                // is then one the user never saw happen, which is what made a
+                // dead session on it impossible to understand.
+                //
+                // `refused` is whether the prompt below is a RETRY. It carries
+                // the reason the second time round and nothing the first: a
+                // prompt answered out of band has not failed in front of anyone
+                // yet, so a line above it would announce a failure that has not
+                // happened — while a bare `Password: ` appearing AGAIN says
+                // nothing about why.
+                let mut refused = false;
+                let status = loop {
+                    let (reply, answers) = bounded(1);
+                    self.tx_event
+                        .try_send(SessionEvent::Authenticate(AuthenticationEvent {
+                            username: "".to_string(),
+                            instructions: if refused {
+                                "Password refused.".to_string()
+                            } else {
+                                String::new()
+                            },
+                            prompts: vec![AuthenticationPrompt {
+                                prompt: "Password: ".to_string(),
+                                echo: false,
+                            }],
+                            // Termob fork: libssh password auth: the answer is
+                            // sent to the server.
+                            origin: AuthPromptOrigin::Server,
+                            reply,
+                        }))
+                        .context("sending Authenticate request to user")?;
 
-                let mut answers = smol::block_on(answers.recv())
-                    .context("waiting for authentication answers from user")
-                    .unwrap();
-                let pw = answers.remove(0);
+                    let mut answers = smol::block_on(answers.recv())
+                        .context("waiting for authentication answers from user")?;
+                    // An empty answer set is a cancelled prompt. `remove(0)`
+                    // would panic on it, and this loop can now reach the prompt
+                    // more than once.
+                    if answers.is_empty() {
+                        anyhow::bail!("user cancelled authentication");
+                    }
+                    let pw = answers.remove(0);
 
-                match sess.userauth_password(None, Some(&pw))? {
-                    AuthStatus::Success => return Ok(()),
+                    match sess.userauth_password(None, Some(&pw))? {
+                        AuthStatus::Success => return Ok(()),
+                        AuthStatus::Denied => {
+                            refused = true;
+                            continue;
+                        }
+                        status => break status,
+                    }
+                };
+                match status {
                     AuthStatus::Partial => continue,
                     status => anyhow::bail!("password auth status: {:?}", status),
                 }
