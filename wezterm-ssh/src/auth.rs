@@ -2,6 +2,16 @@ use crate::session::SessionEvent;
 use anyhow::Context;
 use smol::channel::{bounded, Sender};
 
+/// Termob fork: the ssh-config key saying that the embedder is holding this
+/// user's password, so authentication should offer it before the public keys.
+///
+/// A hint, not a secret: the password itself never reaches the ssh config
+/// (`mux::ssh::TERMOB_PASSWORD_OPTION` is taken out of it), and the config is
+/// logged in full when `wezterm_ssh_verbose` is set. Set to `yes` only where
+/// the user chose PASSWORD authentication — the same field carries a key's
+/// passphrase, and that must never be offered to the server as a password.
+pub const TERMOB_PREFER_PASSWORD_OPTION: &str = "termob_prefer_password";
+
 #[derive(Debug)]
 pub struct AuthenticationPrompt {
     pub prompt: String,
@@ -196,9 +206,69 @@ impl crate::sessioninner::SessionInner {
             _ => {}
         }
 
+        // Termob fork: whether the embedder is holding this user's password,
+        // and so whether offering it first is worth a try.
+        let prefer_password = matches!(
+            self.config
+                .get(TERMOB_PREFER_PASSWORD_OPTION)
+                .map(String::as_str),
+            Some("yes")
+        );
+        let mut password_offered = false;
+
         loop {
             let auth_methods = sess.userauth_list(None)?;
             let mut status_by_method = HashMap::new();
+
+            // Termob fork: where the embedder already has the password, offer
+            // it before the public keys rather than after them.
+            //
+            // `userauth_public_key_auto` offers the agent's keys and then every
+            // default identity file, and each offer is a round trip. Against a
+            // host 150 ms away that turned authentication into about seven of
+            // them — a second of a five-second connection — spent proving that
+            // keys the user was not authenticating with do not work.
+            //
+            // ONE attempt, and a refusal falls through to the ordinary chain
+            // below rather than asking again here: a user whose key would have
+            // worked must still connect, which is what ordering password first
+            // would otherwise have taken away. The retry that a refusal does
+            // deserve happens in the PASSWORD branch, after the other methods
+            // have had their turn.
+            //
+            // Only for a real password. The same field carries a private key's
+            // passphrase (the embedder collects one secret either way), and
+            // offering THAT here would send it to the server as a password —
+            // so the embedder sets this option only when the user chose
+            // password authentication.
+            if prefer_password && !password_offered && auth_methods.contains(AuthMethods::PASSWORD) {
+                password_offered = true;
+                let (reply, answers) = bounded(1);
+                self.tx_event
+                    .try_send(SessionEvent::Authenticate(AuthenticationEvent {
+                        username: "".to_string(),
+                        instructions: String::new(),
+                        prompts: vec![AuthenticationPrompt {
+                            prompt: "Password: ".to_string(),
+                            echo: false,
+                        }],
+                        origin: AuthPromptOrigin::Server,
+                        reply,
+                    }))
+                    .context("sending Authenticate request to user")?;
+                let mut answers = smol::block_on(answers.recv())
+                    .context("waiting for authentication answers from user")?;
+                if !answers.is_empty() {
+                    let password = answers.remove(0);
+                    match sess.userauth_password(None, Some(&password))? {
+                        AuthStatus::Success => return Ok(()),
+                        AuthStatus::Partial => continue,
+                        status => {
+                            status_by_method.insert(AuthMethods::PASSWORD, status);
+                        }
+                    }
+                }
+            }
 
             if auth_methods.contains(AuthMethods::PUBLIC_KEY) {
                 match sess.userauth_public_key_auto(None, None)? {

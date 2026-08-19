@@ -211,6 +211,18 @@ pub struct RemoteSshDomain {
     dom: SshDomain,
     id: DomainId,
     name: String,
+    /// Termob fork: the password most recently supplied by the embedder, held
+    /// apart from `dom` so that it can be replaced.
+    ///
+    /// A domain is never removed from the multiplexer, so a second connection
+    /// to a host finds the entry the first one left — including an entry whose
+    /// authentication failed. Reading the password out of `dom` would then
+    /// re-use the FIRST attempt's, and the one the user has just typed would
+    /// never be tried. See [`RemoteSshDomain::adopt_supplied_password`].
+    supplied_password: Mutex<Option<String>>,
+    /// Termob fork: signalled when the first pane's pty is ready. See
+    /// [`RemoteSshDomain::pty_ready`].
+    pty_ready: (smol::channel::Sender<()>, smol::channel::Receiver<()>),
 }
 
 /// Termob fork: the `ssh_option` key carrying a password the embedder already
@@ -224,6 +236,17 @@ pub struct RemoteSshDomain {
 /// is logged in full when `wezterm_ssh_verbose` is set, and wezterm-ssh has no
 /// use for the value in any case.
 pub const TERMOB_PASSWORD_OPTION: &str = "termob_password";
+
+/// Termob fork: the password an [`SshDomain`] carries, if it carries one.
+///
+/// An empty value is the same thing as no value: the field the user left blank
+/// must leave the prompt to the pane rather than answer it with nothing.
+fn supplied_password_of(dom: &SshDomain) -> Option<String> {
+    dom.ssh_option
+        .get(TERMOB_PASSWORD_OPTION)
+        .filter(|p| !p.is_empty())
+        .cloned()
+}
 
 pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap> {
     let mut ssh_config = wezterm_ssh::Config::new();
@@ -283,8 +306,23 @@ impl RemoteSshDomain {
             id,
             name: dom.name.clone(),
             session: Mutex::new(None),
+            supplied_password: Mutex::new(supplied_password_of(dom)),
+            pty_ready: smol::channel::bounded(1),
             dom: dom.clone(),
         })
+    }
+
+    /// Termob fork: take the supplied password from `dom`, replacing whatever
+    /// an earlier connection to this host left behind.
+    ///
+    /// Called before spawning on a domain the multiplexer already holds. The
+    /// rest of `dom` is deliberately NOT adopted: reaching a host that is
+    /// already reached re-uses that connection rather than establishing another,
+    /// so its address, port and identity files are settled — the secret is the
+    /// one thing a further attempt legitimately changes, because the previous
+    /// one may have been refused.
+    pub fn adopt_supplied_password(&self, dom: &SshDomain) {
+        *self.supplied_password.lock().unwrap() = supplied_password_of(dom);
     }
 
     pub fn ssh_config(&self) -> anyhow::Result<ConfigMap> {
@@ -299,6 +337,25 @@ impl RemoteSshDomain {
     /// on the same authenticated connection.
     pub fn connected_session(&self) -> Option<Session> {
         self.session.lock().unwrap().clone()
+    }
+
+    /// Termob fork: resolves once this domain's first pane has a real pty.
+    ///
+    /// Everything an embedder asks this session for — sftp above all — is
+    /// served on the one session thread, in the order it was queued, with the
+    /// socket in blocking mode. Auxiliary work started when `spawn_pane`
+    /// returns is therefore queued BEFORE the pty request, because that
+    /// request is only made once authentication completes: it delays the first
+    /// prompt by however long it takes, and a subsystem the far end is slow to
+    /// open holds the prompt for as long as it blocks.
+    ///
+    /// Waiting on this puts that work behind the pane instead of in front of
+    /// it. Capacity of one, filled with `force_send`: signalling never blocks
+    /// the connection, a receiver that arrives late still finds the token, and
+    /// what it finds is the most recent pty rather than one belonging to a
+    /// session this domain has since replaced.
+    pub fn pty_ready(&self) -> smol::channel::Receiver<()> {
+        self.pty_ready.1.clone()
     }
 
     fn build_command(
@@ -444,15 +501,14 @@ impl RemoteSshDomain {
         // to perform the blocking (from its perspective) terminal
         // UI to carry out any authentication.
         let mut stdout_write = BufWriter::new(stdout_write);
-        // Termob fork: read straight off the domain rather than out of the ssh
-        // config, which deliberately never carries it — see
-        // `TERMOB_PASSWORD_OPTION`.
-        let supplied_password = self
-            .dom
-            .ssh_option
-            .get(TERMOB_PASSWORD_OPTION)
-            .filter(|p| !p.is_empty())
-            .cloned();
+        // Termob fork: read the password the embedder supplied rather than the
+        // ssh config, which deliberately never carries it — see
+        // `TERMOB_PASSWORD_OPTION`. It is taken from the domain's own field
+        // rather than from `dom`, so that a further attempt against a host this
+        // domain already stands for uses the secret typed for THAT attempt; see
+        // `adopt_supplied_password`.
+        let supplied_password = self.supplied_password.lock().unwrap().clone();
+        let pty_ready_tx = self.pty_ready.0.clone();
         std::thread::spawn(move || {
             if let Err(err) = connect_ssh_session(
                 session,
@@ -467,6 +523,7 @@ impl RemoteSshDomain {
                 command_line,
                 env,
                 supplied_password,
+                pty_ready_tx,
             ) {
                 let _ = write!(stdout_write, "{:#}", err);
                 log::error!("Failed to connect ssh: {:#}", err);
@@ -500,6 +557,9 @@ fn connect_ssh_session(
     // Termob fork: a password the embedder already has, answered to the first
     // non-echoing prompt. See `TERMOB_PASSWORD_OPTION`.
     mut supplied_password: Option<String>,
+    // Termob fork: signalled once the pty exists, so that an embedder's own
+    // work on this session queues behind it. See `RemoteSshDomain::pty_ready`.
+    pty_ready_tx: smol::channel::Sender<()>,
 ) -> anyhow::Result<()> {
     struct StdoutShim<'a> {
         size: Arc<Mutex<TerminalSize>>,
@@ -742,6 +802,15 @@ fn connect_ssh_session(
                         break;
                     }
                     Ok((pty, child)) => {
+                        // Termob fork: release anything waiting to use this
+                        // session for work of its own. `force_send` rather than
+                        // `try_send`: the domain outlives the session, so a
+                        // token left there by an earlier connection's pty would
+                        // otherwise answer for this one — and the waiter would
+                        // go ahead before the pane it is meant to queue behind.
+                        // Replacing it keeps the signal about the pty that has
+                        // just been granted.
+                        let _ = pty_ready_tx.force_send(());
                         drop(shim);
 
                         // Obtain the real stdin/stdout for the pty
