@@ -339,6 +339,30 @@ impl RemoteSshDomain {
         self.session.lock().unwrap().clone()
     }
 
+    /// Termob fork: close this domain's connection, and forget it.
+    ///
+    /// A domain is never removed from the multiplexer, so it outlives the
+    /// connection it was built for and must be able to say so: the next
+    /// `spawn_pane` then finds nothing to reuse and establishes a new one,
+    /// rather than discovering through a failed request that what it held was a
+    /// corpse.
+    ///
+    /// Nothing here decides WHEN — that is the embedder's, which is the only
+    /// party that knows whether anything still wants the connection.
+    ///
+    /// Answers whether there was a connection to close. Several paths reach a
+    /// closing tab and each of them asks; without an answer, every one of them
+    /// reports having closed the connection that the first of them closed.
+    pub fn close_session(&self) -> bool {
+        match self.session.lock().unwrap().take() {
+            Some(session) => {
+                session.shutdown();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Termob fork: resolves once this domain's first pane has a real pty.
     ///
     /// Everything an embedder asks this session for — sftp above all — is
@@ -734,6 +758,20 @@ fn connect_ssh_session(
         }
     }
 
+    // Where the wait between pressing "connect" and seeing a prompt actually
+    // goes.
+    //
+    // Everything the embedder can time itself finishes in milliseconds — the
+    // domain is registered, this thread is started, and the pane is handed
+    // back before a single packet has been exchanged. The whole of the
+    // perceived delay is inside this loop: the transport handshake, then as
+    // many authentication round trips as the server asks for, then the pty
+    // request. Without these two lines the only honest answer to "why is
+    // connecting slow" is a guess, so they are permanent rather than
+    // temporary, and at `info` because one line per connection is not a per-
+    // frame cost.
+    let connect_started = std::time::Instant::now();
+
     // Process authentication related events
     while let Ok(event) = smol::block_on(events.recv()) {
         match event {
@@ -804,6 +842,10 @@ fn connect_ssh_session(
                 shim.render(&message)?;
             }
             SessionEvent::Authenticated => {
+                log::info!(
+                    "ssh authenticated after {:?}",
+                    connect_started.elapsed()
+                );
                 // Our session has been authenticated: we can now
                 // set up the real pty for the pane
                 match smol::block_on(session.request_pty(
@@ -817,6 +859,7 @@ fn connect_ssh_session(
                         break;
                     }
                     Ok((pty, child)) => {
+                        log::info!("ssh pty ready after {:?}", connect_started.elapsed());
                         // Termob fork: release anything waiting to use this
                         // session for work of its own. `force_send` rather than
                         // `try_send`: the domain outlives the session, so a
@@ -969,10 +1012,24 @@ impl Domain for RemoteSshDomain {
     }
 
     fn state(&self) -> DomainState {
-        // Just pretend that we are always attached, as we don't
-        // have a defined attach operation that is distinct from
-        // a spawn.
-        DomainState::Attached
+        // Termob fork: a connection that has ended says so.
+        //
+        // Upstream answered `Attached` unconditionally, on the grounds that
+        // there is no attach operation distinct from a spawn. That is true of
+        // ATTACHING and says nothing about having been DETACHED: the answer
+        // stayed `Attached` after the transport was lost, so the one thing an
+        // embedder can ask about a connection's health always said it was
+        // healthy, and a session whose host had gone was indistinguishable
+        // from one that was merely quiet.
+        //
+        // A domain that has not connected yet keeps upstream's answer. Nothing
+        // has been lost there, and reporting a target as disconnected in the
+        // moment before its first pane exists would announce a failure that
+        // has not happened.
+        match self.session.lock().unwrap().as_ref() {
+            Some(session) if !session.is_alive() => DomainState::Detached,
+            _ => DomainState::Attached,
+        }
     }
 }
 

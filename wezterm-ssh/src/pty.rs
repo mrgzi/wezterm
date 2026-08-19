@@ -7,6 +7,7 @@ use smol::channel::{bounded, Receiver, TryRecvError};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::Mutex;
+use std::time::Instant;
 
 #[derive(Debug)]
 pub(crate) struct NewPty {
@@ -214,9 +215,17 @@ impl crate::sessioninner::SessionInner {
         sess: &mut SessionWrap,
         newpty: NewPty,
     ) -> anyhow::Result<(SshPty, SshChildProcess)> {
+        // Where a pty setup's time goes. Every step below is a round trip, so
+        // on a distant host the total is decided by how MANY of them there are
+        // rather than by the cost of any one. Without this the whole setup is a
+        // single unexplained gap between authentication and the first byte of
+        // the shell.
+        let started = Instant::now();
         sess.set_blocking(true);
+        let blocking_at = started.elapsed();
 
         let mut channel = sess.open_session()?;
+        let opened_at = started.elapsed();
 
         if let Some("yes") = self.config.get("forwardagent").map(|s| s.as_str()) {
             if self.identity_agent().is_some() {
@@ -227,9 +236,12 @@ impl crate::sessioninner::SessionInner {
         }
 
         channel.request_pty(&newpty)?;
+        let pty_at = started.elapsed();
 
+        let mut env_requests = 0usize;
         if let Some(env) = &newpty.env {
             for (key, val) in env {
+                env_requests += 1;
                 if let Err(err) = channel.request_env(key, val) {
                     // Depending on the server configuration, a given
                     // setenv request may not succeed, but that doesn't
@@ -258,11 +270,24 @@ impl crate::sessioninner::SessionInner {
             }
         }
 
+        let env_at = started.elapsed();
+
         if let Some(cmd) = &newpty.command_line {
             channel.request_exec(cmd)?;
         } else {
             channel.request_shell()?;
         }
+        log::debug!(
+            "new_pty in {:?}: set_blocking {:?}, open_session {:?}, request_pty {:?}, \
+             {} env requests {:?}, exec/shell {:?}",
+            started.elapsed(),
+            blocking_at,
+            opened_at - blocking_at,
+            pty_at - opened_at,
+            env_requests,
+            env_at - pty_at,
+            started.elapsed() - env_at
+        );
 
         let channel_id = self.next_channel_id;
         self.next_channel_id += 1;

@@ -12,7 +12,8 @@ use crate::sftpwrap::SftpWrap;
 use anyhow::{anyhow, Context};
 use camino::Utf8PathBuf;
 use filedescriptor::{
-    poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT,
+    poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, SocketDescriptor, POLLIN,
+    POLLOUT,
 };
 use portable_pty::ExitStatus;
 use smol::channel::{bounded, Receiver, Sender, TryRecvError};
@@ -20,6 +21,8 @@ use socket2::{Domain, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Termob fork: shortest wait in the session poll loop, and the value the
@@ -120,6 +123,55 @@ fn set_unacked_data_limit(_sock: &Socket, _limit: Duration) -> std::io::Result<(
     Ok(())
 }
 
+/// Termob fork: how many bytes the far end has not taken delivery of.
+///
+/// Unsent and unacknowledged together — everything the kernel is still holding
+/// on this connection's behalf. Zero means the peer has acknowledged all of it,
+/// which is the only fact that distinguishes a quiet connection from one that
+/// has stopped answering: nothing arriving is equally consistent with a command
+/// that has printed nothing yet.
+///
+/// `None` where the platform is not asked, or the call fails. A caller must
+/// read that as "no answer available", never as zero.
+///
+/// One integer on each platform, deliberately: the richer interfaces
+/// (`TCP_CONNECTION_INFO`, `TCP_INFO`) mean mirroring a kernel struct whose
+/// layout is not ours, for figures beyond this one that nothing here needs.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn undelivered_bytes(sock: SocketDescriptor) -> Option<u32> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            sock,
+            libc::SOL_SOCKET,
+            libc::SO_NWRITE,
+            std::ptr::addr_of_mut!(value).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0).then(|| value.max(0) as u32)
+}
+
+/// Termob fork: see the Apple arm above.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn undelivered_bytes(sock: SocketDescriptor) -> Option<u32> {
+    let mut value: libc::c_int = 0;
+    let rc = unsafe { libc::ioctl(sock, libc::TIOCOUTQ, std::ptr::addr_of_mut!(value)) };
+    (rc == 0).then(|| value.max(0) as u32)
+}
+
+/// Termob fork: see the Apple arm above. This platform is not asked.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+fn undelivered_bytes(_sock: SocketDescriptor) -> Option<u32> {
+    None
+}
+
 /// Termob fork: set one integer `IPPROTO_TCP` option on `sock`.
 ///
 /// `socket2` covers neither of the options above, so the call is made directly.
@@ -177,9 +229,28 @@ pub(crate) struct SessionInner {
     pub next_file_id: FileId,
     pub sender_read: FileDescriptor,
     pub session_was_dropped: bool,
+    /// Termob fork: the embedder has closed this connection. Unlike
+    /// `session_was_dropped` this does not wait for the channels to drain — see
+    /// `SessionRequest::Shutdown`.
+    pub shutdown_requested: bool,
     pub shown_accept_env_error: bool,
     pub last_keep_alive: Instant,
     pub keep_alive: Option<Duration>,
+    /// Termob fork: when the far end was last holding something of ours it had
+    /// not acknowledged, and had not acknowledged it since. `None` while the
+    /// connection is answering. See [`SessionInner::note_delivery`].
+    /// Termob fork: set once this session reaches its request loop, which is
+    /// the moment it is authenticated and serving. Before that the thread is
+    /// still resolving, connecting and authenticating — a state a holder of the
+    /// handle cannot otherwise tell from a working connection, because the
+    /// handle and its thread exist throughout. See [`crate::Session::is_established`].
+    pub established: Arc<AtomicBool>,
+    pub undelivered_since: Option<Instant>,
+    /// Termob fork: the same thing, in milliseconds, for a holder of the
+    /// [`crate::Session`] handle to read from its own thread. Zero means the
+    /// far end is keeping up — the only value it takes while all is well, so a
+    /// reader needs no second flag.
+    pub unanswered_ms: Arc<AtomicU64>,
 }
 
 impl Drop for SessionInner {
@@ -423,6 +494,12 @@ impl SessionInner {
         }
         sess.set_blocking(false);
         let mut sess = SessionWrap::with_libssh(sess);
+        // The boundary between "the session is
+        // ready" and "the session is serving requests". Everything the
+        // embedder asks for lands after this point, so a delay before it and
+        // a delay inside the loop have entirely different causes and are
+        // otherwise indistinguishable from the outside.
+        log::debug!("ssh session authenticated; entering request loop");
         self.request_loop(&mut sess)
     }
 
@@ -646,11 +723,62 @@ impl SessionInner {
         }
     }
 
+    /// Termob fork: read whether the far end is keeping up, and for how long it
+    /// has not been.
+    ///
+    /// Called every turn of the loop, which is at worst a quarter of a second
+    /// apart — fine enough for a figure the user reads in seconds, and one
+    /// `getsockopt` is far below what the loop already does per turn.
+    ///
+    /// The clock starts when bytes first go undelivered and is NOT restarted
+    /// while they stay that way: what the reader wants is how long the far end
+    /// has been silent, not how long the newest byte has waited. Any moment
+    /// with nothing outstanding clears it, because the peer has just proved it
+    /// is there.
+    fn note_delivery(&mut self, sess: &SessionWrap) {
+        let outstanding = match undelivered_bytes(sess.as_socket_descriptor()) {
+            Some(bytes) => bytes,
+            // The platform does not answer. Nothing is claimed rather than
+            // "everything is fine": see `undelivered_bytes`.
+            None => return,
+        };
+        if outstanding == 0 {
+            self.undelivered_since = None;
+        } else if self.undelivered_since.is_none() {
+            self.undelivered_since = Some(Instant::now());
+        }
+        let waiting = self
+            .undelivered_since
+            .map_or(0, |since| since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+        self.unanswered_ms.store(waiting, Ordering::Relaxed);
+    }
+
     fn request_loop(&mut self, sess: &mut SessionWrap) -> anyhow::Result<()> {
+        // Termob fork: authenticated, and from here on serving requests. This
+        // is the one point that separates "being established" from
+        // "established" — see `SessionInner::established`.
+        self.established.store(true, Ordering::Relaxed);
         let mut sleep_delay = MIN_POLL_DELAY;
 
         loop {
+            // Where an iteration's time goes, while the session still has no
+            // channel.
+            //
+            // A request queued microseconds after this loop started was not
+            // served for nearly two seconds, and from outside the loop that is
+            // indistinguishable from a slow server. The window is bounded on
+            // purpose: once a channel exists this is the hot path for every
+            // keystroke, and it says nothing there that the echo latency does
+            // not already say. The clock is not read at all outside that
+            // window — `mark` answers zero — so the hot path pays a branch and
+            // nothing else.
+            let setting_up = self.channels.is_empty();
+            let iteration = setting_up.then(Instant::now);
+            let mark = |at: Option<Instant>| at.map_or(Duration::ZERO, |at| at.elapsed());
+
+            self.note_delivery(sess);
             self.do_keepalive(sess)?;
+            let keepalive_at = mark(iteration);
             // Termob fork: `tick_io` reports whether it actually moved bytes.
             // A single tick performs at most one read per channel, so when it
             // did move data the ssh library may still be holding more in its
@@ -660,9 +788,23 @@ impl SessionInner {
             // chunk per timeout, which is what made heavy output arrive in
             // visible stutters.
             let moved_io = self.tick_io()?;
+            let io_at = mark(iteration);
             self.drain_request_pipe();
+            let drain_at = mark(iteration);
             self.dispatch_pending_requests(sess)?;
+            let dispatch_at = mark(iteration);
             self.connect_pending_agent_forward_channels(sess);
+            let forward_at = mark(iteration);
+
+            // Termob fork: asked to close, so close — the channels are not
+            // consulted. They belong to panes the caller has already finished
+            // with, and waiting for them to drain makes the moment the
+            // connection actually ends depend on how the last of their output
+            // happened to fall.
+            if self.shutdown_requested {
+                log::debug!("Stopping session loop: the connection was closed by its owner");
+                return Ok(());
+            }
 
             if self.channels.is_empty() && self.session_was_dropped {
                 log::trace!(
@@ -747,7 +889,20 @@ impl SessionInner {
             // must not busy-poll) but it can no longer grow past
             // `MAX_POLL_DELAY`.
             let wait = if moved_io { Duration::ZERO } else { sleep_delay };
+            let worked = mark(iteration);
             poll(&mut poll_array, Some(wait)).context("poll")?;
+            if setting_up {
+                log::debug!(
+                    "setup loop iteration: keepalive {keepalive_at:?}, io {:?}, \
+                     drain {:?}, dispatch {:?}, agent forward {:?}, poll {:?} \
+                     (waited up to {wait:?})",
+                    io_at - keepalive_at,
+                    drain_at - io_at,
+                    dispatch_at - drain_at,
+                    forward_at - dispatch_at,
+                    mark(iteration) - worked
+                );
+            }
             sleep_delay = if moved_io {
                 MIN_POLL_DELAY
             } else {
@@ -938,6 +1093,13 @@ impl SessionInner {
                     SessionRequest::SessionDropped => {
                         self.session_was_dropped = true;
                         Ok(true)
+                    }
+                    // Termob fork: stop draining as well as stop looping —
+                    // whatever else is queued was addressed to a connection the
+                    // caller has already finished with.
+                    SessionRequest::Shutdown => {
+                        self.shutdown_requested = true;
+                        Ok(false)
                     }
                     SessionRequest::NewPty(newpty, reply) => {
                         dispatch(reply, || self.new_pty(sess, newpty), "NewPty")
@@ -1409,7 +1571,16 @@ where
     T: Send + Sync + 'static,
 {
     if let Err(err) = reply.try_send(f()) {
-        log::error!("{}: {:#}", what, err);
+        // Termob fork: at `debug`, because this says nothing about the
+        // operation.
+        //
+        // The reply channel is created per request and holds one slot, so the
+        // only way this fails is that whoever asked has since gone away — an
+        // sftp handle closed as its owner was torn down reaches here every
+        // time. The work was still done; what is missing is somebody to tell.
+        // Reported as an error, it named the operation ("close_file") and read
+        // as that operation having failed.
+        log::debug!("{}: nothing is waiting for the answer: {:#}", what, err);
     }
     Ok(true)
 }
