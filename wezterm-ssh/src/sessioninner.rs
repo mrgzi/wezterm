@@ -223,6 +223,42 @@ impl SessionInner {
             sess.set_option(libssh_rs::SshOption::HostKeys(host_key.to_string()))?;
         }
 
+        // Termob fork: no blocking call waits for ever.
+        //
+        // Every request the embedder makes is served on this one thread with
+        // the session in blocking mode, and libssh resolves a blocking wait to
+        // `SSH_TIMEOUT_INFINITE` unless this option carries a value
+        // (`ssh_handle_packets_termination`). Against a peer that has stopped
+        // answering — a network changed under a live connection, which is the
+        // ordinary case on a phone — opening one channel therefore blocked the
+        // session thread until TCP gave up, and with it every other pane, the
+        // request to close the connection, and the whole of the next tab the
+        // user tried to open. The wait is what turns "this connection is gone"
+        // into an error somebody can be told about.
+        //
+        // It is set AFTER `options_parse_config` on purpose: libssh maps
+        // `ConnectTimeout` onto this same value, so a user's ssh config would
+        // otherwise decide how long the product may hang for. Connecting has
+        // its own bound (`connect_timeout`); this one is about everything
+        // after.
+        //
+        // Generous, because it is the backstop rather than the detector: the
+        // socket is dropped by the operating system long before this
+        // (`TRANSPORT_UNACKED_LIMIT`), and the one legitimate wait of this
+        // order is a server holding an authentication reply while a second
+        // factor is answered somewhere else.
+        const BLOCKING_CALL_LIMIT: Duration = Duration::from_secs(60);
+        sess.set_option(libssh_rs::SshOption::Timeout(BLOCKING_CALL_LIMIT))?;
+
+        // The transport handshake is timed on its own, so that a slow network
+        // can be told apart from a slow authentication.
+        //
+        // `mux::ssh` reports the time to authenticate and the time to a pty;
+        // both of those contain this one, and the two have entirely different
+        // causes — a distant host, against a server asking for method after
+        // method. Only the libssh path carries this, because it is the only
+        // backend the product selects.
+        let handshake_started = Instant::now();
         let (sock, _child) = self.connect_to_host(&hostname, port, verbose)?;
         let raw = {
             #[cfg(unix)]
@@ -241,6 +277,10 @@ impl SessionInner {
 
         sess.connect()
             .with_context(|| format!("Connecting to {hostname}:{port}"))?;
+        log::info!(
+            "ssh transport handshake to {hostname}:{port} took {:?}",
+            handshake_started.elapsed()
+        );
 
         let banner = sess.get_server_banner()?;
         self.tx_event
@@ -514,6 +554,19 @@ impl SessionInner {
                     "Stopping session loop as there are no more channels and Session was dropped"
                 );
                 return Ok(());
+            }
+
+            // Termob fork: the transport has gone, so say so.
+            //
+            // Asked after the two deliberate endings above and before any
+            // further work, so that a connection the owner closed is reported
+            // as closed rather than as lost. The loop otherwise carried on
+            // polling a socket the ssh library had already given up on: the
+            // panes on it neither produced output nor died, and nothing on
+            // screen said the connection had ended — a frozen terminal, which
+            // is indistinguishable from a slow one.
+            if !sess.is_connected() {
+                anyhow::bail!("the connection to the host was lost");
             }
 
             // Termob fork: also watch the session socket for readability

@@ -43,6 +43,27 @@ impl SessionWrap {
         }
     }
 
+    /// Termob fork: whether the ssh library still considers this session live.
+    ///
+    /// libssh clears it the moment the socket reports an error or is closed
+    /// under it (`ssh_socket_nonblocking_flush`), which is the one place the
+    /// loss of a transport is recorded at all: nothing else in this crate asks
+    /// the question, so a session whose peer had gone kept polling a dead
+    /// socket and answering no request.
+    ///
+    /// `ssh2` has no equivalent and answers "live" — it is not the backend the
+    /// product selects, and inventing an answer for it would be worse than
+    /// saying nothing.
+    pub fn is_connected(&self) -> bool {
+        match self {
+            #[cfg(feature = "ssh2")]
+            Self::Ssh2(_sess) => true,
+
+            #[cfg(feature = "libssh-rs")]
+            Self::LibSsh(sess) => sess.sess.is_connected(),
+        }
+    }
+
     pub fn get_poll_flags(&self) -> i16 {
         match self {
             #[cfg(feature = "ssh2")]
