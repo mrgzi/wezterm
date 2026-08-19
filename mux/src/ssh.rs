@@ -429,10 +429,25 @@ impl RemoteSshDomain {
             Ok(cd_cmd + &shell_words::join(env_cmd) + " " + &cmd)
         }
 
-        let command_line = match (cmd.is_default_prog(), self.dom.assume_shell, command_dir) {
-            (_, Shell::Posix, dir) => Some(build_env_command(dir, &cmd, &env)?),
-            (true, _, _) => None,
-            (false, _, _) => Some(cmd.as_unix_command_line()?),
+        // Where the environment has been folded into the command line, it is
+        // NOT also handed back to be requested one variable at a time.
+        //
+        // `build_env_command` prefixes the command with `env K=V ...`, which
+        // is the whole point of knowing the shell is POSIX — the values are
+        // already on their way. Returning the same map as well made `new_pty`
+        // send a `setenv` channel request for each of them, and a channel
+        // request is a round trip. A default `sshd` refuses all of them
+        // (`AcceptEnv` lists none of these names), so the connection paid five
+        // round trips to be told "no" five times, having already delivered the
+        // values by a route that works. Measured at 0.76 s of a 5.2 s
+        // connection to a host 150 ms away, and paid again by every split.
+        let (command_line, env) = match (cmd.is_default_prog(), self.dom.assume_shell, command_dir) {
+            (_, Shell::Posix, dir) => (
+                Some(build_env_command(dir, &cmd, &env)?),
+                HashMap::new(),
+            ),
+            (true, _, _) => (None, env),
+            (false, _, _) => (Some(cmd.as_unix_command_line()?), env),
         };
 
         Ok((command_line, env))
