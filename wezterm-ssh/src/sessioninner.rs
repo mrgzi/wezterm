@@ -36,6 +36,120 @@ const MIN_POLL_DELAY: Duration = Duration::from_millis(100);
 /// busy-polling.
 const MAX_POLL_DELAY: Duration = Duration::from_millis(250);
 
+/// Termob fork: how long what we have sent may go unacknowledged before the
+/// operating system declares the connection dead, in seconds.
+///
+/// The keepalive above it sends an IGNORE packet every `ServerAliveInterval`
+/// and nothing ever answers one, so a peer that has stopped listening is
+/// discovered by the ACK that does not come rather than by a reply that does —
+/// which is the only detector available here, because libssh's own
+/// `ssh_send_keepalive` (a global request that DOES demand an answer) is not
+/// exposed by the Rust binding. Left to the defaults, that discovery takes the
+/// full retransmission budget: minutes on macOS, and until then the session is
+/// a black hole that accepts requests and answers none.
+///
+/// Twenty seconds is above any transient a live connection survives — a
+/// handover or a lost radio second is a handful of retransmissions — and well
+/// below the interval, so a vanished peer is known within one keepalive period
+/// plus this. It is not a way to survive a change of network: a TCP connection
+/// belongs to the address it was opened from, so moving to another one ends it
+/// whatever this says.
+const TRANSPORT_UNACKED_LIMIT: Duration = Duration::from_secs(20);
+
+/// Termob fork: the socket options every SSH transport is opened with.
+///
+/// `ssh(1)` sets `TCP_NODELAY` on its own socket and libssh sets it on sockets
+/// IT opens (`SSH_OPTIONS_NODELAY`, defaulting to off, applied in its own
+/// connect path). This socket is opened here and handed over as a descriptor,
+/// so neither of them ever reaches it: without this, every packet small enough
+/// to be worth coalescing waits on Nagle's algorithm for an acknowledgement
+/// that the peer is holding back on its own delayed-ACK timer.
+///
+/// Failures are absorbed. Both options are advice about how a healthy
+/// connection should behave; a kernel that refuses one is not a reason to
+/// refuse the connection, and the caller has no better answer than to carry on
+/// without it.
+fn set_transport_options(sock: &Socket) {
+    if let Err(err) = sock.set_nodelay(true) {
+        log::warn!("could not disable Nagle on the ssh transport: {err:#}");
+    }
+    if let Err(err) = set_unacked_data_limit(sock, TRANSPORT_UNACKED_LIMIT) {
+        log::warn!("could not bound the ssh transport's retransmission: {err:#}");
+    }
+}
+
+/// Termob fork: drop the connection once data has gone unacknowledged for
+/// `limit`. See [`TRANSPORT_UNACKED_LIMIT`].
+///
+/// The two platforms name this differently and count it differently — seconds
+/// here, milliseconds there — and neither unit is documented where the option
+/// is; finding: F-006. TCP keepalive does not answer this case: it runs only
+/// while the connection is idle, and a vanished peer leaves data in flight.
+///
+/// Windows is deliberately absent rather than unimplemented: its own
+/// `TcpMaxDataRetransmissions` default already bounds this at the same order of
+/// magnitude, whereas the BSD and Linux defaults are minutes.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_unacked_data_limit(sock: &Socket, limit: Duration) -> std::io::Result<()> {
+    use std::convert::TryFrom;
+    // Milliseconds on this platform, seconds on the other.
+    let millis = u32::try_from(limit.as_millis()).unwrap_or(u32::MAX);
+    set_tcp_option(sock, libc::TCP_USER_TIMEOUT, millis)
+}
+
+/// Termob fork: see the Linux arm above.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn set_unacked_data_limit(sock: &Socket, limit: Duration) -> std::io::Result<()> {
+    /// `TCP_RXT_CONNDROPTIME` from `<netinet/tcp.h>`: "time after which tcp
+    /// retransmissions will be stopped and the connection will be dropped".
+    /// Named here because the `libc` crate does not carry it.
+    const TCP_RXT_CONNDROPTIME: libc::c_int = 0x80;
+    use std::convert::TryFrom;
+    let secs = u32::try_from(limit.as_secs()).unwrap_or(u32::MAX);
+    set_tcp_option(sock, TCP_RXT_CONNDROPTIME, secs)
+}
+
+/// Termob fork: see the Linux arm above. Nothing to do on this platform.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+fn set_unacked_data_limit(_sock: &Socket, _limit: Duration) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Termob fork: set one integer `IPPROTO_TCP` option on `sock`.
+///
+/// `socket2` covers neither of the options above, so the call is made directly.
+/// The unsafety is the FFI call itself: the value outlives it, its length is
+/// its own, and the descriptor is borrowed for the duration.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn set_tcp_option(sock: &Socket, option: libc::c_int, value: u32) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let value = value as libc::c_uint;
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            option,
+            std::ptr::addr_of!(value).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct DescriptorState {
     pub fd: Option<FileDescriptor>,
@@ -459,6 +573,7 @@ impl SessionInner {
             .with_context(|| {
                 format!("Connecting to {hostname}:{port} ({addr:?}) within {timeout:?}")
             })?;
+        set_transport_options(&sock);
         Ok((sock, None))
     }
 
