@@ -13,6 +13,7 @@ use smol::channel::{bounded, Receiver as AsyncReceiver};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufWriter, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -218,8 +219,31 @@ pub struct RemoteSshDomain {
     /// to a host finds the entry the first one left — including an entry whose
     /// authentication failed. Reading the password out of `dom` would then
     /// re-use the FIRST attempt's, and the one the user has just typed would
-    /// never be tried. See [`RemoteSshDomain::adopt_supplied_password`].
+    /// never be tried. See [`RemoteSshDomain::adopt_supplied_settings`].
     supplied_password: Mutex<Option<String>>,
+    /// Termob fork: the `ssh_option`s most recently supplied by the embedder,
+    /// held apart from `dom` for the reason `supplied_password` is — and for the
+    /// same failure, one step further out.
+    ///
+    /// These are what the connection is MADE from: the identity files, the port,
+    /// the keepalive. A domain outlives the connection it was built for
+    /// ([`RemoteSshDomain::close_session`]), so a second connection to a host
+    /// establishes a new one — and reading these out of `dom` would establish it
+    /// with the first attempt's identity rather than the one the user has since
+    /// chosen. See [`RemoteSshDomain::adopt_supplied_settings`].
+    supplied_options: Mutex<HashMap<String, String>>,
+    /// Termob fork: whether a connection this domain held has been closed.
+    ///
+    /// **What tells "closed" from "not connected yet".** Both leave `session`
+    /// empty, and [`RemoteSshDomain::state`] answered `Attached` for the pair of
+    /// them — so a domain whose connection the embedder had just closed reported
+    /// itself as carrying, which is the one question that method exists to
+    /// answer. Nothing reads it wrongly today only because the surface that
+    /// would ask has gone by then; it is a wrong answer waiting for a caller.
+    ///
+    /// Set by [`RemoteSshDomain::close_session`] and cleared when a new session
+    /// is established, so a domain reconnected through is `Attached` again.
+    session_closed: AtomicBool,
     /// Termob fork: signalled when the first pane's pty is ready. See
     /// [`RemoteSshDomain::pty_ready`].
     pty_ready: (smol::channel::Sender<()>, smol::channel::Receiver<()>),
@@ -307,26 +331,46 @@ impl RemoteSshDomain {
             name: dom.name.clone(),
             session: Mutex::new(None),
             supplied_password: Mutex::new(supplied_password_of(dom)),
+            supplied_options: Mutex::new(dom.ssh_option.clone()),
+            session_closed: AtomicBool::new(false),
             pty_ready: smol::channel::bounded(1),
             dom: dom.clone(),
         })
     }
 
-    /// Termob fork: take the supplied password from `dom`, replacing whatever
-    /// an earlier connection to this host left behind.
+    /// Termob fork: take this attempt's connection settings from `dom`,
+    /// replacing whatever an earlier connection to this host left behind.
     ///
-    /// Called before spawning on a domain the multiplexer already holds. The
-    /// rest of `dom` is deliberately NOT adopted: reaching a host that is
-    /// already reached re-uses that connection rather than establishing another,
-    /// so its address, port and identity files are settled — the secret is the
-    /// one thing a further attempt legitimately changes, because the previous
-    /// one may have been refused.
-    pub fn adopt_supplied_password(&self, dom: &SshDomain) {
+    /// Called before spawning on a domain the multiplexer already holds. A
+    /// domain is never removed from the multiplexer, so it outlives the
+    /// connection it was built for: once [`Self::close_session`] has run, the
+    /// next spawn ESTABLISHES a connection rather than re-using one, and it must
+    /// establish the connection the embedder is asking for now.
+    ///
+    /// This adopted the password alone, on the reasoning that a host already
+    /// reached has its identity settled. That holds only while the connection is
+    /// live. With it closed, a user who chose a key file and connected again was
+    /// authenticated with the FIRST attempt's identity — commonly none at all —
+    /// so the key they had just picked was never offered and the host asked for
+    /// a password instead. Which of the two happened depended on whether
+    /// anything had connected to that host earlier in the process, so it read as
+    /// a key that worked sometimes.
+    ///
+    /// The address and the port cannot disagree here: the domain is looked up by
+    /// a name the embedder derives from them. The rest of `dom` — the shell, the
+    /// default program — is deliberately not adopted, because those describe
+    /// what runs inside a pane rather than how the connection is made.
+    pub fn adopt_supplied_settings(&self, dom: &SshDomain) {
         *self.supplied_password.lock().unwrap() = supplied_password_of(dom);
+        *self.supplied_options.lock().unwrap() = dom.ssh_option.clone();
     }
 
     pub fn ssh_config(&self) -> anyhow::Result<ConfigMap> {
-        ssh_domain_to_ssh_config(&self.dom)
+        // Termob fork: the options this attempt supplied, not the ones the
+        // domain was built with — see [`Self::adopt_supplied_settings`].
+        let mut dom = self.dom.clone();
+        dom.ssh_option = self.supplied_options.lock().unwrap().clone();
+        ssh_domain_to_ssh_config(&dom)
     }
 
     /// Returns a clone of the underlying SSH session handle, if the session
@@ -357,6 +401,10 @@ impl RemoteSshDomain {
         match self.session.lock().unwrap().take() {
             Some(session) => {
                 session.shutdown();
+                // Recorded because taking the session leaves this domain
+                // indistinguishable from one that never connected, and the two
+                // owe opposite answers to `state`.
+                self.session_closed.store(true, Ordering::Relaxed);
                 true
             }
             None => false,
@@ -486,6 +534,10 @@ impl RemoteSshDomain {
         let (session, events) = Session::connect(self.ssh_config().context("obtain ssh config")?)
             .context("connect to ssh server")?;
         self.session.lock().unwrap().replace(session.clone());
+        // Termob fork: this domain is carrying again, so whatever it closed
+        // before stops being what `state` reports. Ordered after the session is
+        // in place, so no reader can find the flag down with nothing behind it.
+        self.session_closed.store(false, Ordering::Relaxed);
 
         // We get to establish the session!
         //
@@ -545,7 +597,7 @@ impl RemoteSshDomain {
         // `TERMOB_PASSWORD_OPTION`. It is taken from the domain's own field
         // rather than from `dom`, so that a further attempt against a host this
         // domain already stands for uses the secret typed for THAT attempt; see
-        // `adopt_supplied_password`.
+        // `adopt_supplied_settings`.
         let supplied_password = self.supplied_password.lock().unwrap().clone();
         let pty_ready_tx = self.pty_ready.0.clone();
         std::thread::spawn(move || {
@@ -1026,8 +1078,14 @@ impl Domain for RemoteSshDomain {
         // has been lost there, and reporting a target as disconnected in the
         // moment before its first pane exists would announce a failure that
         // has not happened.
+        //
+        // A domain whose connection was CLOSED is the other empty case and owes
+        // the opposite answer: it did carry one and does not now. The two are
+        // told apart by `session_closed`, because taking the session leaves no
+        // trace of there having been one.
         match self.session.lock().unwrap().as_ref() {
             Some(session) if !session.is_alive() => DomainState::Detached,
+            None if self.session_closed.load(Ordering::Relaxed) => DomainState::Detached,
             _ => DomainState::Attached,
         }
     }
