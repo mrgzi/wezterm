@@ -569,11 +569,23 @@ impl Config {
         }
     }
 
+    /// The per-user config file that [`Self::add_default_config_files`] reads,
+    /// where this platform has a home directory to keep one in.
+    ///
+    /// Exposed so that a caller which needs to name that file — to write an
+    /// entry into it, or to say where an entry went — asks the same question of
+    /// the same code, rather than deriving the home directory a second time
+    /// through a second crate and disagreeing on a platform where the two
+    /// answer differently.
+    pub fn default_user_config_path() -> Option<PathBuf> {
+        dirs_next::home_dir().map(|home| home.join(".ssh").join("config"))
+    }
+
     /// Convenience method for adding the ~/.ssh/config and system-wide
     /// `/etc/ssh/config` files to the list of configs
     pub fn add_default_config_files(&mut self) {
-        if let Some(home) = dirs_next::home_dir() {
-            self.add_config_file(home.join(".ssh").join("config"));
+        if let Some(path) = Self::default_user_config_path() {
+            self.add_config_file(path);
         }
         self.add_config_file("/etc/ssh/ssh_config");
         if let Ok(sysdrive) = std::env::var("SystemDrive") {
