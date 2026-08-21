@@ -120,6 +120,9 @@ pub struct Session {
     /// Termob fork: whether the session thread has got as far as serving
     /// requests. See [`Session::is_established`].
     established: Arc<AtomicBool>,
+    /// Termob fork: whether authentication was won by a public key.
+    /// See [`Session::authenticated_with_key`].
+    authenticated_with_key: Arc<AtomicBool>,
 }
 
 /// Termob fork: the one owner of the "these handles are gone" signal.
@@ -162,6 +165,7 @@ impl Session {
         let now = Instant::now();
         let unanswered_ms = Arc::new(AtomicU64::new(0));
         let established = Arc::new(AtomicBool::new(false));
+        let authenticated_with_key = Arc::new(AtomicBool::new(false));
 
         let mut inner = SessionInner {
             config,
@@ -179,6 +183,7 @@ impl Session {
             last_keep_alive: now,
             keep_alive,
             established: Arc::clone(&established),
+            authenticated_with_key: Arc::clone(&authenticated_with_key),
             undelivered_since: None,
             unanswered_ms: Arc::clone(&unanswered_ms),
         };
@@ -189,6 +194,7 @@ impl Session {
                 _alive: Arc::new(SessionAlive { tx: session_sender }),
                 unanswered_ms,
                 established,
+                authenticated_with_key,
             },
             rx_event,
         ))
@@ -259,6 +265,31 @@ impl Session {
     #[must_use]
     pub fn unanswered_for(&self) -> Duration {
         Duration::from_millis(self.unanswered_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Termob fork: did a public key win this session's authentication?
+    ///
+    /// `true` once a key — from the agent or from an identity file — was
+    /// accepted; `false` for a password, for keyboard-interactive, and for a
+    /// server that asked for nothing.
+    ///
+    /// **A fact this side already has, which the far end would otherwise have to
+    /// be asked for.** A client that offers to install a key at a host wants to
+    /// know whether that host already takes one, and the honest answer is one
+    /// round trip down the queue this session serves its channels on. It is also
+    /// unnecessary: authentication has just happened, and what won it is known
+    /// here. The loop returns from whichever branch succeeded and said nothing
+    /// about which, so nothing outside could tell a key login from a password
+    /// one.
+    ///
+    /// It does not go back to `false`. It describes how this session was
+    /// authenticated, which is settled once and for the life of the session.
+    ///
+    /// PR candidate: additive, one atomic, no behaviour changed.
+    #[must_use]
+    pub fn authenticated_with_key(&self) -> bool {
+        self.authenticated_with_key
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn request_pty(

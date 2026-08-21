@@ -65,6 +65,17 @@ impl AuthenticationEvent {
 }
 
 impl crate::sessioninner::SessionInner {
+    /// Termob fork: record that a public key won this session's authentication.
+    ///
+    /// Called from every branch a key can win on — the agent's keys and the
+    /// identity files alike, since both prove who the user is with a key the far
+    /// end already authorises. See [`crate::Session::authenticated_with_key`]
+    /// for why the fact is kept at all.
+    fn note_key_authentication(&self) {
+        self.authenticated_with_key
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     #[cfg(feature = "ssh2")]
     fn agent_auth(&mut self, sess: &ssh2::Session, user: &str) -> anyhow::Result<bool> {
         if let Some(only) = self.config.get("identitiesonly") {
@@ -272,7 +283,13 @@ impl crate::sessioninner::SessionInner {
 
             if auth_methods.contains(AuthMethods::PUBLIC_KEY) {
                 match sess.userauth_public_key_auto(None, None)? {
-                    AuthStatus::Success => return Ok(()),
+                    AuthStatus::Success => {
+                        // Termob fork: what won is worth recording, because the
+                        // only other way to learn it is to ask the far end.
+                        // See `crate::Session::authenticated_with_key`.
+                        self.note_key_authentication();
+                        return Ok(());
+                    }
                     AuthStatus::Partial => continue,
                     status => {
                         status_by_method.insert(AuthMethods::PUBLIC_KEY, status);
@@ -464,11 +481,15 @@ impl crate::sessioninner::SessionInner {
             log::trace!("ssh auth methods: {:?}", methods);
 
             if !sess.authenticated() && methods.contains("publickey") {
+                // Termob fork: both branches are a key winning, and what won is
+                // worth recording — see `crate::Session::authenticated_with_key`.
                 if self.agent_auth(sess, user)? {
+                    self.note_key_authentication();
                     continue;
                 }
 
                 if self.pubkey_auth(sess, user, host)? {
+                    self.note_key_authentication();
                     continue;
                 }
             }

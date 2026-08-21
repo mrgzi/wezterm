@@ -236,15 +236,19 @@ pub(crate) struct SessionInner {
     pub shown_accept_env_error: bool,
     pub last_keep_alive: Instant,
     pub keep_alive: Option<Duration>,
-    /// Termob fork: when the far end was last holding something of ours it had
-    /// not acknowledged, and had not acknowledged it since. `None` while the
-    /// connection is answering. See [`SessionInner::note_delivery`].
     /// Termob fork: set once this session reaches its request loop, which is
     /// the moment it is authenticated and serving. Before that the thread is
     /// still resolving, connecting and authenticating — a state a holder of the
     /// handle cannot otherwise tell from a working connection, because the
     /// handle and its thread exist throughout. See [`crate::Session::is_established`].
     pub established: Arc<AtomicBool>,
+    /// Termob fork: set where a public key won authentication, and left alone
+    /// where a password or keyboard-interactive did. See
+    /// [`crate::Session::authenticated_with_key`].
+    pub authenticated_with_key: Arc<AtomicBool>,
+    /// Termob fork: when the far end was last holding something of ours it had
+    /// not acknowledged, and had not acknowledged it since. `None` while the
+    /// connection is answering. See [`SessionInner::note_delivery`].
     pub undelivered_since: Option<Instant>,
     /// Termob fork: the same thing, in milliseconds, for a holder of the
     /// [`crate::Session`] handle to read from its own thread. Zero means the
