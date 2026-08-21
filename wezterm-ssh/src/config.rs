@@ -631,6 +631,82 @@ impl Config {
     /// the config parsed a second time in order for value expansion
     /// to have the same results as `ssh`.
     pub fn for_host<H: AsRef<str>>(&self, host: H) -> ConfigMap {
+        let mut result = self.for_host_as_stated(host);
+
+        result
+            .entry("port".to_string())
+            .or_insert_with(|| "22".to_string());
+
+        result
+            .entry("user".to_string())
+            .or_insert_with(|| self.resolve_local_user());
+
+        // Termob fork: the defaults below are built from `$HOME`, which can
+        // contain a space (`C:\Users\John Doe`, `/Users/John Doe`). Joining
+        // them raw produced a list that `split_path_list` would take apart at
+        // the wrong place, so every user with a spaced home silently had no
+        // known_hosts file and no default identities.
+        fn join_paths_under_home(home: &str, names: &[&str]) -> String {
+            names
+                .iter()
+                .map(|name| quote_path_for_list(&format!("{home}/{name}")))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        if !result.contains_key("userknownhostsfile") {
+            if let Some(home) = self.resolve_home() {
+                result.insert(
+                    "userknownhostsfile".to_string(),
+                    join_paths_under_home(&home, &[".ssh/known_hosts", ".ssh/known_hosts2"]),
+                );
+            }
+        }
+
+        if !result.contains_key("identityfile") {
+            if let Some(home) = self.resolve_home() {
+                result.insert(
+                    "identityfile".to_string(),
+                    join_paths_under_home(
+                        &home,
+                        &[
+                            ".ssh/id_dsa",
+                            ".ssh/id_ecdsa",
+                            ".ssh/id_ed25519",
+                            ".ssh/id_rsa",
+                        ],
+                    ),
+                );
+            }
+        }
+
+        if !result.contains_key("identityagent") {
+            if let Some(sock_path) = self.resolve_env("SSH_AUTH_SOCK") {
+                result.insert("identityagent".to_string(), sock_path);
+            }
+        }
+
+        result
+    }
+
+    /// Termob fork: what the configuration files STATE for a given host, without
+    /// the defaults [`Self::for_host`] fills in over them afterwards.
+    ///
+    /// `for_host` stamps `port`, `user`, `userknownhostsfile`, `identityfile`
+    /// and `identityagent` on top of whatever the files said, so an entry that
+    /// states `Port 22` and one that states no port at all come back identical.
+    /// That is right for making a connection and wrong for a client that offers
+    /// the user their own entries to read and edit: it cannot show back what
+    /// they wrote, because it can no longer tell what they wrote.
+    ///
+    /// Everything else is the same work in the same order — the matches, the
+    /// two-phase warning, the token and environment expansion — so the two
+    /// cannot drift. `hostname` IS still filled in from the host name, because
+    /// the token expansion below resolves `%h` from it.
+    ///
+    /// PR candidate: additive, and the existing behaviour of `for_host` is
+    /// unchanged.
+    pub fn for_host_as_stated<H: AsRef<str>>(&self, host: H) -> ConfigMap {
         let host = host.as_ref();
         let local_user = self.resolve_local_user();
         let target_user = &local_user;
@@ -713,59 +789,6 @@ impl Config {
 
             if self.should_expand_environment(k) {
                 self.expand_environment(v);
-            }
-        }
-
-        result
-            .entry("port".to_string())
-            .or_insert_with(|| "22".to_string());
-
-        result
-            .entry("user".to_string())
-            .or_insert_with(|| target_user.clone());
-
-        // Termob fork: the defaults below are built from `$HOME`, which can
-        // contain a space (`C:\Users\John Doe`, `/Users/John Doe`). Joining
-        // them raw produced a list that `split_path_list` would take apart at
-        // the wrong place, so every user with a spaced home silently had no
-        // known_hosts file and no default identities.
-        fn join_paths_under_home(home: &str, names: &[&str]) -> String {
-            names
-                .iter()
-                .map(|name| quote_path_for_list(&format!("{home}/{name}")))
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
-
-        if !result.contains_key("userknownhostsfile") {
-            if let Some(home) = self.resolve_home() {
-                result.insert(
-                    "userknownhostsfile".to_string(),
-                    join_paths_under_home(&home, &[".ssh/known_hosts", ".ssh/known_hosts2"]),
-                );
-            }
-        }
-
-        if !result.contains_key("identityfile") {
-            if let Some(home) = self.resolve_home() {
-                result.insert(
-                    "identityfile".to_string(),
-                    join_paths_under_home(
-                        &home,
-                        &[
-                            ".ssh/id_dsa",
-                            ".ssh/id_ecdsa",
-                            ".ssh/id_ed25519",
-                            ".ssh/id_rsa",
-                        ],
-                    ),
-                );
-            }
-        }
-
-        if !result.contains_key("identityagent") {
-            if let Some(sock_path) = self.resolve_env("SSH_AUTH_SOCK") {
-                result.insert("identityagent".to_string(), sock_path);
             }
         }
 
