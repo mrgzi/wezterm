@@ -321,7 +321,13 @@ impl ParsedConfigFile {
             if let Some(sep) = line.find(|c: char| c == '=' || c.is_whitespace()) {
                 let (k, v) = line.split_at(sep);
                 let k = k.trim().to_lowercase();
-                let v = v[1..].trim();
+                // Step over the separator by its width in bytes, not by one.
+                // `char::is_whitespace` accepts forms two and three bytes wide
+                // — U+00A0 arrives in a config file whenever a line was pasted
+                // out of a web page — and `v[1..]` then began inside that
+                // character, which panics rather than parsing.
+                let sep_len = v.chars().next().map_or(1, char::len_utf8);
+                let v = v[sep_len..].trim();
 
                 // Termob fork: remember whether the quotes were there. A path
                 // list has to be re-quoted before it is stored (see
